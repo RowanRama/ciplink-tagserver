@@ -1,11 +1,13 @@
-"""One thread per PLC: owns the driver, polls the subscribed tags, runs the queued writes."""
+"""One thread per PLC: owns the driver, polls the subscribed tags by tier, runs the queued writes."""
 
 import logging
+import math
 import queue
 import threading
 import time
 from concurrent.futures import Future
 
+from . import planner
 from .values import tag_list, to_value
 
 log = logging.getLogger(__name__)
@@ -19,18 +21,28 @@ class PlcWorker:
     backoff = (1, 2, 5, 10)  # seconds between reconnect attempts, the last one repeats
     missing_retry = 10  # seconds before a tag the PLC doesn't have is asked for again, unless the tag table reloads
 
-    def __init__(self, cfg, factory, cycle_ms, on_values=None, on_status=None, on_meta=None):
+    def __init__(self, cfg, factory, cycle_ms, on_values=None, on_status=None, on_meta=None,
+                 tier2_period_s=3, grace_s=10, planner=True, whole_max_bytes=1500):
         self.name = cfg.name
         self.cfg = cfg
         self.factory = factory  # cfg -> driver, not yet opened
         self.cycle = cycle_ms / 1000
+        self.tier2_period = tier2_period_s
+        self.grace_s = grace_s
+        self.planner = planner
+        self.whole_max_bytes = whole_max_bytes
         self.on_values = on_values or (lambda plc, changes: None)  # called from this thread
         self.on_status = on_status or (lambda plc, state: None)
         self.on_meta = on_meta or (lambda plc: None)
 
         self.state = "connecting"
-        self.lock = threading.Lock()  # guards tags and cache
-        self.tags = set()  # tag names polled each cycle
+        self.lock = threading.Lock()  # guards tiers, grace and cache
+        self.tiers = {}  # tag -> 1 (read every cycle), 2 (round robin, every tier2_period) or 3 (not read)
+        self.grace = {}  # tag that left tier 1 -> (monotonic time it leaves tier 2, tier after that or None)
+        self._tier2 = None  # tier-2 tags in name order, None when to be rebuilt
+        self._slice = 0
+        self._plans = {}  # frozenset of tags -> read plan, cleared when the subscriptions or tag table change
+        self._no_group = set()  # struct paths whose whole read failed, not grouped again until a reload
         self.cache = {}  # tag -> [value, quality, t]
         self.missing = {}  # tag -> monotonic time to ask for it again; skipped until then
         self.writes = queue.Queue()  # (tag, value, Future)
@@ -38,7 +50,9 @@ class PlcWorker:
 
         self.last_cycle_ms = None
         self.last_ok_ts = None
-        self.reads_per_cycle = 0
+        self.reads_per_cycle = 0  # read services sent, after planning
+        self.tags_per_cycle = 0
+        self.group_fallbacks = 0  # whole struct reads that failed, their members read one by one instead
         self.overruns = 0
         self.reconnects = 0
         self.reloads = 0
@@ -58,16 +72,66 @@ class PlcWorker:
         if self._thread.is_alive():
             self._thread.join(timeout)
 
-    def add_tags(self, tags):
-        with self.lock:
-            self.tags.update(tags)
+    @property
+    def tags(self) -> set:
+        return set(self.tiers)
 
-    def remove_tags(self, tags):
+    def tier_counts(self) -> dict:
+        with self.lock:
+            tiers = list(self.tiers.values())
+        return {f"tier{n}": tiers.count(n) for n in (1, 2, 3)}
+
+    def add_tags(self, tags, tier=1):
         with self.lock:
             for tag in tags:
-                self.tags.discard(tag)
-                self.cache.pop(tag, None)
-                self.missing.pop(tag, None)
+                self._set(tag, tier)
+
+    def remove_tags(self, tags):
+        """Stops polling the tags at once, without the grace period."""
+        with self.lock:
+            for tag in tags:
+                self._set(tag, None)
+
+    def set_tier(self, tag, tier):
+        """A tag's tier, None when nothing subscribes it. A tag leaving tier 1 for tier 3 or nothing is read
+        at tier 2 for grace_s first, so a page visited again finds its values fresh."""
+        with self.lock:
+            if (tier is not None and tier <= 2) or self.grace_s <= 0:
+                self._set(tag, tier)
+            elif self.tiers.get(tag) == 1:
+                self._set(tag, 2)
+                self.grace[tag] = (time.monotonic() + self.grace_s, tier)
+            elif tag in self.grace:
+                self.grace[tag] = (self.grace[tag][0], tier)
+            else:
+                self._set(tag, tier)
+
+    def _set(self, tag, tier):  # holding the lock
+        self.grace.pop(tag, None)
+        if tier is None:
+            self.tiers.pop(tag, None)
+            self.cache.pop(tag, None)
+            self.missing.pop(tag, None)
+        else:
+            self.tiers[tag] = tier
+        self._tier2 = None
+        self._plans.clear()
+
+    def _cycle_tags(self, now) -> list:
+        """This cycle's reads: all of tier 1 and the next slice of tier 2 (holding the lock)."""
+        for tag, (deadline, tier) in list(self.grace.items()):
+            if deadline <= now:
+                self._set(tag, tier)
+        tags = [tag for tag, tier in self.tiers.items() if tier == 1]
+        if self._tier2 is None:  # in name order, so members of one struct tend to share a slice
+            self._tier2 = sorted((tag for tag, tier in self.tiers.items() if tier == 2), key=str.lower)
+        if self._tier2:
+            slices = max(1, round(self.tier2_period / self.cycle)) if self.cycle > 0 else 1
+            size = math.ceil(len(self._tier2) / slices)
+            i = self._slice % slices
+            self._slice += 1
+            tags += self._tier2[i * size:(i + 1) * size]
+        return [tag for tag in tags if self.missing.get(tag, 0) <= now]
 
     def snapshot(self, tags) -> dict:
         with self.lock:
@@ -120,16 +184,16 @@ class PlcWorker:
         while not self._stop.is_set():
             start = time.monotonic()
             with self.lock:
-                tags = [tag for tag in self.tags if self.missing.get(tag, 0) <= start]
+                tags = self._cycle_tags(start)
+            services = 0
             if tags:
-                results = plc.read(*tags)
-                if not isinstance(results, list):
-                    results = [results]
+                results, services = self._read(plc, tags)
                 t = now_ms()
                 changes = {}
                 with self.lock:
-                    for tag, result in zip(tags, results):
-                        if tag not in self.tags:  # unsubscribed during the read
+                    for tag in tags:
+                        result = results[tag]
+                        if tag not in self.tiers:  # unsubscribed during the read
                             continue
                         value, quality = to_value(result)
                         if quality == "missing":  # don't ask (and make the driver log) every cycle
@@ -142,7 +206,8 @@ class PlcWorker:
                             changes[tag] = [value, quality, t]
                 if changes:
                     self.on_values(self.name, changes)
-            self.reads_per_cycle = len(tags)
+            self.reads_per_cycle = services
+            self.tags_per_cycle = len(tags)
             self._check_version(plc)
             self._run_writes(plc)
             self.last_ok_ts = now_ms()
@@ -152,6 +217,26 @@ class PlcWorker:
                 self.overruns += 1
             elif self.wait(self.cycle - elapsed):
                 return
+
+    def _read(self, plc, tags):
+        """({tag: Tag result}, read services sent), through the planner unless it is off."""
+        if not self.planner or not hasattr(plc, "get_tag_info"):
+            reads = [(tag, [(tag, None)]) for tag in tags]
+        else:
+            key = frozenset(tags)
+            reads = self._plans.get(key)
+            if reads is None:
+                if len(self._plans) > 100:  # tier-2 slices make a few sets per subscription change
+                    self._plans.clear()
+                reads = planner.plan(tags, plc.get_tag_info, self.whole_max_bytes, frozenset(self._no_group))
+                self._plans[key] = reads
+        results, failed, services = planner.execute(plc, reads)
+        if failed:
+            self.group_fallbacks += len(failed)
+            log.warning("%s: whole read of %s failed, reading the members instead", self.name, ", ".join(failed))
+            self._no_group.update(name.lower() for name in failed)
+            self._plans.clear()
+        return results, services
 
     def _run_writes(self, plc):
         while True:
@@ -179,6 +264,8 @@ class PlcWorker:
             self.tag_list = tag_list(plc)
             with self.lock:
                 self.missing.clear()  # a new or renamed tag may exist now
+                self._no_group.clear()
+                self._plans.clear()  # members or struct sizes may have changed
 
     def _fail_writes(self, error):
         while True:

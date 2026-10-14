@@ -40,7 +40,7 @@ def test_subscribe_snapshot_and_changes_only(make):
     fake.values.update({"Speed": 10, "Count": 1})
     with client.websocket_connect("/ws") as ws:
         hello(ws)
-        ws.send_json({"op": "sub", "id": 1, "tags": ["Speed", "PLC1/Count", "Nope"], "tier": 2})
+        ws.send_json({"op": "sub", "id": 1, "tags": ["Speed", "PLC1/Count", "Nope"], "tier": 1})
         assert until(ws, lambda m: m["op"] == "ack") == {"op": "ack", "id": 1, "ok": True, "error": None}
         first = until(ws, is_values)["d"]
         assert first["Speed"][:2] == [10, "good"]

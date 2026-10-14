@@ -26,6 +26,11 @@ class Config:
     port: int = 8765
     cycle_ms: int = 250
     audit_log: str = "audit.log"
+    tier2_period_s: float = 3  # each tier-2 tag is read about this often
+    grace_s: float = 10  # a tag leaving tier 1 stays at tier 2 this long
+    pages_file: str | None = "pages.json"  # learned page -> tags, None to keep them in memory only
+    planner: bool = True  # read structs whole when that saves reads
+    whole_max_bytes: int = 1500  # largest struct the planner reads whole
     plcs: dict[str, PlcConfig] = field(default_factory=dict)
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
 
@@ -63,6 +68,11 @@ def parse_config(data: dict, base_dir=".") -> Config:
         port=server.get("port", 8765),
         cycle_ms=server.get("cycle_ms", 250),
         audit_log=resolve(server.get("audit_log", "audit.log")),
+        tier2_period_s=server.get("tier2_period_s", 3),
+        grace_s=server.get("grace_s", 10),
+        pages_file=resolve(server.get("pages_file", "pages.json")),
+        planner=server.get("planner", True),
+        whole_max_bytes=server.get("whole_max_bytes", 1500),
     )
     for name, plc in data.get("plc", {}).items():
         config.plcs[name] = PlcConfig(

@@ -37,7 +37,8 @@ def mock_factory(cfg):
 class Session:
     def __init__(self, token):
         self.token = token
-        self.subs = {}  # sub id -> {"tier": int, "tags": {qualified name: name as the client sent it}}
+        # sub id -> {"tier": int, "tags": {qualified name: name as the client sent it}, "follow": page or None}
+        self.subs = {}
         self.queue = asyncio.Queue()  # messages to send
 
     def name_of(self, qname):
@@ -47,14 +48,41 @@ class Session:
         return None
 
 
+def load_pages(path) -> dict:
+    """page path -> set of qualified tag names, from the pages file; empty if there is none."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as file:
+            return {page: set(tags) for page, tags in json.load(file).items()}
+    except (OSError, ValueError, AttributeError) as err:
+        log.warning("cannot read %s: %r", path, err)
+        return {}
+
+
+def save_pages(path, pages):
+    """Writes the pages file atomically: a temporary file, then a rename over the old one."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as file:
+        json.dump({page: sorted(tags) for page, tags in sorted(pages.items())}, file, indent=1)
+    os.replace(tmp, path)
+
+
 class Hub:
+    save_delay = 2.0  # seconds: page learning is saved at most this often
+
     def __init__(self, config, factory):
         self.config = config
         self.sessions = set()
-        self.refs = Counter()  # qualified name -> subscriptions across sessions
+        self.refs = {}  # qualified name -> Counter(tier -> subscriptions across sessions)
+        self.pages = load_pages(config.pages_file)  # page path -> qualified names its tier-1 subs used
+        self._save_handle = None
         self.loop = None
         self.workers = {
-            name: PlcWorker(cfg, factory, config.cycle_ms, self._on_values, self._on_status, self._on_meta)
+            name: PlcWorker(cfg, factory, config.cycle_ms, self._on_values, self._on_status, self._on_meta,
+                            tier2_period_s=config.tier2_period_s, grace_s=config.grace_s,
+                            planner=config.planner, whole_max_bytes=config.whole_max_bytes)
             for name, cfg in config.plcs.items()
         }
 
@@ -66,6 +94,9 @@ class Hub:
     def stop(self):
         for worker in self.workers.values():
             worker.stop()
+        if self._save_handle is not None:
+            self._save_handle.cancel()
+            self._save_pages()
 
     def states(self):
         return {name: worker.state for name, worker in self.workers.items()}
@@ -112,26 +143,44 @@ class Hub:
 
     # requests, on the event loop
 
-    def subscribe(self, session, sub_id, names, tier):
-        """Returns the cached values of the subscribed tags, keyed by the names as given."""
-        if not isinstance(names, list):
-            raise TypeError("tags must be a list")
-        tags = {}
-        for name in names:
-            plc, tag = self.config.qualify(name)
-            tags[f"{plc}/{tag}"] = name
+    def subscribe(self, session, sub_id, names, tier=1, page=None):
+        """Returns the cached values of the subscribed tags, keyed by the names as given.
+
+        ``page`` (a route path): tier-1 tags teach the server that page's tags; with ``names`` None the
+        subscription is that page's learned tags, kept up to date as the page teaches more."""
+        if tier not in (1, 2, 3):
+            raise ValueError("tier must be 1, 2 or 3")
+        if page is not None and not isinstance(page, str):
+            raise TypeError("page must be a string")
+        follow = None
+        if names is None:
+            if page is None:
+                raise KeyError("tags")
+            follow = page
+            tags = {qname: self._client_name(qname) for qname in sorted(self.pages.get(page, ()))}
+        else:
+            if not isinstance(names, list):
+                raise TypeError("tags must be a list")
+            tags = {}
+            for name in names:
+                plc, tag = self.config.qualify(name)
+                tags[f"{plc}/{tag}"] = name
         if sub_id in session.subs:
             self.unsubscribe(session, sub_id)
-        session.subs[sub_id] = {"tier": tier, "tags": tags}
+        session.subs[sub_id] = {"tier": tier, "tags": tags, "follow": follow}
         snapshot = {}
         for qname, name in tags.items():
             plc, tag = qname.split("/", 1)
-            self.refs[qname] += 1
-            if self.refs[qname] == 1:
-                self.workers[plc].add_tags([tag])
+            counts = self.refs.setdefault(qname, Counter())
+            before = min(counts) if counts else None
+            counts[tier] += 1
+            if tier != before and (before is None or tier < before):
+                self.workers[plc].set_tier(tag, tier)
             entry = self.workers[plc].snapshot([tag]).get(tag)
             if entry is not None:
                 snapshot[name] = entry
+        if page is not None and follow is None and tier == 1:
+            self._learn(page, tags)
         return snapshot
 
     def unsubscribe(self, session, sub_id):
@@ -139,12 +188,43 @@ class Hub:
         if sub is None:
             return False
         for qname in sub["tags"]:
-            self.refs[qname] -= 1
-            if self.refs[qname] <= 0:
+            counts = self.refs[qname]
+            before = min(counts)
+            counts[sub["tier"]] -= 1
+            if counts[sub["tier"]] <= 0:
+                del counts[sub["tier"]]
+            after = min(counts) if counts else None
+            if not counts:
                 del self.refs[qname]
+            if after != before:
                 plc, tag = qname.split("/", 1)
-                self.workers[plc].remove_tags([tag])
+                self.workers[plc].set_tier(tag, after)
         return True
+
+    def _client_name(self, qname):
+        """How a page subscription names a learned tag: unqualified when there is only one PLC."""
+        return qname.split("/", 1)[1] if len(self.workers) == 1 else qname
+
+    def _learn(self, page, qnames):
+        known = self.pages.setdefault(page, set())
+        if set(qnames) <= known:
+            return
+        known.update(qnames)
+        if self.config.pages_file and self.loop is not None and self._save_handle is None:
+            self._save_handle = self.loop.call_later(self.save_delay, self._save_pages)
+        for session in self.sessions:  # page subscriptions follow what their page learns
+            for sub_id, sub in list(session.subs.items()):
+                if sub["follow"] == page:
+                    snapshot = self.subscribe(session, sub_id, None, sub["tier"], page)
+                    if snapshot:
+                        session.queue.put_nowait({"op": "values", "d": snapshot})
+
+    def _save_pages(self):
+        self._save_handle = None
+        try:
+            save_pages(self.config.pages_file, self.pages)
+        except OSError as err:
+            log.warning("cannot write %s: %r", self.config.pages_file, err)
 
     def drop(self, session):
         for sub_id in list(session.subs):
@@ -197,8 +277,9 @@ def create_app(config, factory=None, mock=False) -> FastAPI:
         return {
             "sessions": len(hub.sessions),
             "plcs": {
-                name: {"reads_per_cycle": w.reads_per_cycle, "last_cycle_ms": w.last_cycle_ms,
-                       "cycle_ms": config.cycle_ms, "overruns": w.overruns, "subscriptions": len(w.tags)}
+                name: {"reads_per_cycle": w.reads_per_cycle, "tags_per_cycle": w.tags_per_cycle,
+                       "last_cycle_ms": w.last_cycle_ms, "cycle_ms": config.cycle_ms, "overruns": w.overruns,
+                       "subscriptions": len(w.tiers), **w.tier_counts(), "group_fallbacks": w.group_fallbacks}
                 for name, w in hub.workers.items()
             },
         }
@@ -253,7 +334,10 @@ def create_app(config, factory=None, mock=False) -> FastAPI:
                     msg_id = msg.get("id")
                     op = msg["op"]
                     if op == "sub":
-                        snapshot = hub.subscribe(session, msg["id"], msg["tags"], msg.get("tier", 1))
+                        tags, page = msg.get("tags"), msg.get("page")
+                        if tags is None and page is None:
+                            raise KeyError("tags")
+                        snapshot = hub.subscribe(session, msg["id"], tags, msg.get("tier", 1), page)
                         session.queue.put_nowait({"op": "ack", "id": msg_id, "ok": True, "error": None})
                         if snapshot:
                             session.queue.put_nowait({"op": "values", "d": snapshot})

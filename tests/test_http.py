@@ -23,7 +23,7 @@ def test_stats(make):
     fakes["PLC1"].values.update({"A": 1, "B": 2})
     with client.websocket_connect("/ws") as ws:
         hello(ws)
-        ws.send_json({"op": "sub", "id": 1, "tags": ["A", "B"], "tier": 3})
+        ws.send_json({"op": "sub", "id": 1, "tags": ["A", "B"]})
         until(ws, lambda m: m["op"] == "values")
         wait_for(lambda: client.get("/stats").json()["plcs"]["PLC1"]["reads_per_cycle"] == 2)
         stats = client.get("/stats").json()
@@ -31,8 +31,7 @@ def test_stats(make):
         plc = stats["plcs"]["PLC1"]
         assert plc["subscriptions"] == 2 and plc["cycle_ms"] == 20
         assert "overruns" in plc and plc["last_cycle_ms"] is not None
-        session = next(iter(client.app.state.hub.sessions))
-        assert session.subs[1]["tier"] == 3  # stored for later
+        assert (plc["tier1"], plc["tier2"], plc["tags_per_cycle"], plc["group_fallbacks"]) == (2, 0, 2, 0)
 
 
 def test_tags(make):
