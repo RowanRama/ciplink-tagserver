@@ -6,7 +6,7 @@ import type { Quality } from "./store.js";
 
 const pages = new Map<string, string[]>();
 
-/** Tells <TagLink to={path}> which tags the page at `path` shows. */
+/** Seeds the tags of the page at `path` for <TagLink to={path}>, on top of those the server learned. */
 export function registerPage(path: string, tags: string[]) {
   pages.set(path, tags);
 }
@@ -22,7 +22,8 @@ export interface TagLinkProps {
 export function TagLink({ to, as, ...rest }: TagLinkProps) {
   const store = useTagStore();
   useEffect(() => {
-    const releases = (pages.get(to) ?? []).map((name) => store.acquire(name, 2));
+    // the tags the server learned for the page, and any registered by hand, at tier 2
+    const releases = [store.acquirePage(to), ...(pages.get(to) ?? []).map((name) => store.acquire(name, 2))];
     return () => releases.forEach((release) => release());
   }, [store, to]);
   return as ? createElement(as, { to, ...rest }) : createElement("a", { href: to, ...rest });

@@ -18,13 +18,16 @@ export interface TagServerProviderProps {
   token: string;
   /** called with the PLC name when its tag table was reloaded (fetch /tags again) */
   onMeta?: (plc: string) => void;
+  /** the current route path, e.g. "/line1": the server learns each page's tags, which <TagLink> prefetches */
+  page?: string;
   children?: ReactNode;
 }
 
 /** Owns one WebSocket to the tag server for everything below it. */
-export function TagServerProvider({ url, token, onMeta, children }: TagServerProviderProps) {
+export function TagServerProvider({ url, token, onMeta, page, children }: TagServerProviderProps) {
   const store = useMemo(() => new TagStore(url, token), [url, token]);
   store.options.onMeta = onMeta;
+  store.page = page; // set while rendering, before the new page's components subscribe
   useEffect(() => {
     store.connect();
     return () => store.close();

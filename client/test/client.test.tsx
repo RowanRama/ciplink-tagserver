@@ -163,12 +163,65 @@ describe("subscriptions", () => {
     expect(text("both")).toBe("7,pending");
   });
 
-  it("TagLink subscribes the registered page's tags at tier 2", async () => {
+  it("TagLink subscribes the target page at tier 2, plus any registered tags", async () => {
     registerPage("/station1", ["Program:Station1.DoorOpen"]);
     wrap(<TagLink to="/station1">Station 1</TagLink>);
     await connect();
-    expect(last().ops("sub")).toEqual([{ op: "sub", id: 1, tags: ["Program:Station1.DoorOpen"], tier: 2 }]);
+    expect(last().ops("sub")).toEqual([
+      { op: "sub", id: 1, page: "/station1", tier: 2 },
+      { op: "sub", id: 2, tags: ["Program:Station1.DoorOpen"], tier: 2 },
+    ]);
     expect(screen.getByText("Station 1").getAttribute("href")).toBe("/station1");
+  });
+
+  it("TagLink page subscriptions are shared and dropped with the last link", async () => {
+    function Links({ n }: { n: number }) {
+      return (
+        <>
+          {Array.from({ length: n }, (_, i) => (
+            <TagLink key={i} to="/line2">
+              Line 2
+            </TagLink>
+          ))}
+        </>
+      );
+    }
+    const ui = (n: number) => (
+      <TagServerProvider url="ws://test/ws" token="T">
+        <Links n={n} />
+      </TagServerProvider>
+    );
+    const { rerender } = render(ui(1));
+    await connect();
+    rerender(ui(2));
+    await flush();
+    expect(last().ops("sub")).toEqual([{ op: "sub", id: 1, page: "/line2", tier: 2 }]);
+    rerender(ui(1));
+    await flush();
+    expect(last().ops("unsub")).toEqual([]);
+    rerender(ui(0));
+    await flush();
+    expect(last().ops("unsub")).toEqual([{ op: "unsub", id: 1 }]);
+  });
+
+  it("tier-1 subscriptions carry the provider's page", async () => {
+    const ui = (page: string, names: string[]) => (
+      <TagServerProvider url="ws://test/ws" token="T" page={page}>
+        {names.map((name) => (
+          <Show key={name} name={name} />
+        ))}
+        <Show name="Slow" tier={2} />
+      </TagServerProvider>
+    );
+    const { rerender } = render(ui("/line1", ["A", "B"]));
+    await connect();
+    expect(last().ops("sub")).toEqual([
+      { op: "sub", id: 1, tags: ["A", "B"], tier: 1, page: "/line1" },
+      { op: "sub", id: 2, tags: ["Slow"], tier: 2 },
+    ]);
+    rerender(ui("/line2", ["C"]));
+    await flush();
+    expect(last().ops("sub").slice(2)).toEqual([{ op: "sub", id: 3, tags: ["C"], tier: 1, page: "/line2" }]);
   });
 });
 

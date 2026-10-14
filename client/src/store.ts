@@ -46,6 +46,12 @@ export class TagStore {
   private groups = new Map<number, { tier: number; tags: Set<string> }>();
   private dirty = new Set<string>();
   private flushQueued = false;
+  // page subscriptions (the tags the server learned for a page): page -> server id and users
+  private pageSubs = new Map<string, { id: number; tier: number; count: number }>();
+
+  /** The current page (route path): tier-1 subscriptions sent while it is set carry it, so the server learns
+   * which tags each page shows. */
+  page: string | undefined;
 
   private nextId = 1;
   private writes = new Map<number, (result: WriteResult) => void>();
@@ -111,6 +117,26 @@ export class TagStore {
     };
   }
 
+  /** Subscribes the tags the server learned for `page` (from tier-1 subscriptions sent while that page was
+   * current), at tier 2 by default; returns the release function. Empty until the page has been visited. */
+  acquirePage(page: string, tier = 2): () => void {
+    let sub = this.pageSubs.get(page);
+    if (!sub) {
+      this.pageSubs.set(page, (sub = { id: this.nextId++, tier, count: 0 }));
+      this.send({ op: "sub", id: sub.id, page, tier });
+    }
+    sub.count++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--sub!.count === 0) {
+        this.pageSubs.delete(page);
+        this.send({ op: "unsub", id: sub!.id });
+      }
+    };
+  }
+
   private touch(name: string) {
     this.dirty.add(name);
     if (!this.flushQueued) {
@@ -159,7 +185,8 @@ export class TagStore {
 
   private sendSub(id: number) {
     const group = this.groups.get(id)!;
-    this.send({ op: "sub", id, tags: [...group.tags], tier: group.tier });
+    const page = group.tier === 1 && this.page !== undefined ? { page: this.page } : {};
+    this.send({ op: "sub", id, tags: [...group.tags], tier: group.tier, ...page });
   }
 
   // writes
@@ -235,6 +262,7 @@ export class TagStore {
         this.attempt = 0;
         this.setInfo({ state: "connected", plcs: msg.plcs ?? {}, canWrite: !!msg.write });
         for (const id of this.groups.keys()) this.sendSub(id);
+        for (const [page, { id, tier }] of this.pageSubs) this.send({ op: "sub", id, page, tier });
         break;
       case "values":
         for (const [name, [value, quality, t]] of Object.entries(msg.d as Record<string, [unknown, Quality, number]>)) {
