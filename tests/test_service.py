@@ -9,7 +9,7 @@ NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
 
 
 def test_task_xml_runs_the_supervisor_at_boot_as_system():
-    config = Path(r"C:\Tag Server\tagserver.toml")
+    config = PureWindowsPath(r"C:\Tag Server\tagserver.toml")  # a Windows path on any OS
     xml = service.task_xml(config, config.with_name("tagserver.log"), python=r"C:\Py & Co\python.exe")
     root = ElementTree.fromstring(xml.split("\n", 1)[1])  # skip the UTF-16 declaration for the parser
     assert root.find("t:Triggers/t:BootTrigger", NS) is not None
