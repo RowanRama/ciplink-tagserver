@@ -1,0 +1,30 @@
+name: release-react
+
+# Push a tag like react-v0.1.1 to test, build and publish @ciplink/react to npm.
+on:
+  push:
+    tags: ["react-v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write  # npm trusted publishing, no stored token
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@^11.5.1  # trusted publishing needs npm 11.5.1 or newer
+      - name: Check the tag matches the package version
+        run: test "react-v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm publish
