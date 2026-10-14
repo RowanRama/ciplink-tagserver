@@ -4,7 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "build:client": "cd ../../client && npm install --no-audit --no-fund && npm run build",
+    "predev": "npm run build:client",
     "dev": "vite",
+    "prebuild": "npm run build:client",
     "build": "tsc -p . && vite build",
     "preview": "vite preview"
   },

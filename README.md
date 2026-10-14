@@ -55,6 +55,11 @@ host = "127.0.0.1"      # localhost only by default
 port = 8765
 cycle_ms = 250          # poll period per PLC
 audit_log = "audit.log" # optional, JSON lines of every write attempt
+tier2_period_s = 3      # each tier-2 tag is read about this often
+grace_s = 10            # a tag leaving tier 1 stays at tier 2 this long
+pages_file = "pages.json" # what each page showed, learned from the clients ("" to keep it in memory)
+planner = true          # read structs whole when that saves reads (false to troubleshoot)
+whole_max_bytes = 1500  # largest struct the planner reads whole
 
 [plc.PLC1]
 path = "192.168.1.10"                    # a ciplink/pycomm3 path, e.g. "10.0.0.5/1/3"
@@ -86,7 +91,8 @@ Client to server:
 | message | meaning |
 |---|---|
 | `{"op":"hello","v":1,"token":"<secret>"}` | must be the first message |
-| `{"op":"sub","id":N,"tags":["..."],"tier":1}` | subscribe; reusing an id replaces that subscription |
+| `{"op":"sub","id":N,"tags":["..."],"tier":1,"page":"/line1"}` | subscribe; reusing an id replaces that subscription. `tier` (default 1) and `page` are optional |
+| `{"op":"sub","id":N,"page":"/line1","tier":2}` | subscribe the tags learned for that page (see Tiers and pages) |
 | `{"op":"unsub","id":N}` | drop subscription N |
 | `{"op":"write","id":N,"tag":"...","value":...}` | write one tag |
 
@@ -109,14 +115,46 @@ Server to client:
 - Values: structs and AOIs are objects, arrays are lists, bytes are hex strings, NaN and infinities are
   the strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
 - PLC states: `connecting`, `connected`, `disconnected`. Reconnects back off 1, 2, 5, then every 10 s.
-- `tier` is stored but not used yet: every subscribed tag is read every cycle.
+- `tier` is 1, 2 or 3, see below.
 - Writes go to the PLC's thread, run after that cycle's read, and the ack carries the driver's result.
   They are never retried; a write while the PLC is not connected fails at once.
+
+## Tiers and pages
+
+A poll costs about 12 ms per packet plus 1.35 ms per read, so the server reads only what is on screen
+every cycle:
+
+| tier | read |
+|---|---|
+| 1 | every cycle: what is on screen |
+| 2 | round robin, each tag about every `tier2_period_s`: what is likely next (a cycle reads all of tier 1 and the next slice of tier 2) |
+| 3 | never: accepted and kept, not polled |
+
+A tag's tier is the lowest among its subscriptions. When its last tier-1 subscription ends it is read at
+tier 2 for `grace_s` more, so going back to a page finds fresh values, then it drops out (or to tier 3).
+
+**Pages.** A tier-1 `sub` carrying `"page": "/line1"` (the client's current route) teaches the server that
+page's tags; it keeps the union per page in `pages_file` (saved a moment after a change, by an atomic
+rename, and loaded at startup). A `sub` with a `page` and no `tags` subscribes the tags learned for that
+page, at its `tier` (2 for a link to it); it is empty until the page has been visited, and follows what the
+page learns. Its values are keyed by the plain tag names with one PLC, else by qualified names.
+
+**Read planner.** Each cycle, members of the same struct are read through one read of that struct and
+sliced out of it: for `Line1.Motor.Speed` and `Line1.Motor.Current`, `Line1.Motor` is read once. The
+struct is the smallest one (a tag, an array element like `Arr[3]`, or a nested member, also in program
+scope) holding two or more of the cycle's tags, of at most `whole_max_bytes`. A tag that is itself a
+whole struct is the read for the tags under it. Never grouped: bit access (`X.Count.5`), several
+elements (`X{3}`), whole arrays, strings, BOOL arrays, and AOIs (or structs holding one) that cannot be
+read whole. If a struct read fails, its members are read one by one in the same cycle and that struct is
+not read whole again until the tag table reloads (`group_fallbacks`). Clients get the same values either
+way; `planner = false` turns it off.
 
 ## HTTP
 
 - `GET /health`: per PLC `state`, `last_cycle_ms`, `last_ok_ts`, `reconnects`, `reloads`.
-- `GET /stats`: `sessions`, and per PLC `reads_per_cycle`, `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`.
+- `GET /stats`: `sessions`, and per PLC `reads_per_cycle` (read services sent in the last cycle, after
+  planning), `tags_per_cycle` (tags it served), `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`,
+  `tier1`, `tier2`, `tier3` (tags per tier) and `group_fallbacks`.
 - `GET /tags?plc=NAME` with `Authorization: Bearer <secret>`: the PLC's tags with data type and, for
   AOIs, `aoi_readable` (the members that can be read). `plc` may be left out with one PLC.
 
@@ -139,12 +177,14 @@ import { TagServerProvider, TagValue, TagLamp, useWriteTag, useTagServer } from 
 - `useTags(names)`, `useWriteTag(name)` (resolves with the write's ack), `useTagServer()` (connection
   state, PLC states, `canWrite`).
 - `<TagValue>` and `<TagLamp>` are fixed width with a quality marker, so nothing moves as values change.
-- `<TagLink to as?>` prefetches the tags of a page registered with `registerPage(path, tags)`.
+- `<TagServerProvider page={path}>`: tier-1 subscriptions carry the current route, so the server learns
+  each page's tags, and `<TagLink to as?>` subscribes the target page's learned tags at tier 2 while it is
+  on screen. `registerPage(path, tags)` seeds a page by hand.
 - Reconnects after 1, 2, 5, then every 10 s, re-subscribes, and shows values as `stale` meanwhile.
 
 A runnable app is in [`examples/react-app/`](examples/react-app/): start the server with
-`uv run ciplink-tagserver run --config examples/tagserver.toml --mock`, build `client/` once
-(`npm install && npm run build`), then `npm install && npm run dev` in the example.
+`uv run ciplink-tagserver run --config examples/tagserver.toml --mock`, then `npm install && npm run dev`
+in the example (it builds `client/` first). It has two pages linked by `<TagLink>`s, to show tier 2.
 
 ## Mock mode
 
