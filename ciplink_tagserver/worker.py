@@ -20,6 +20,7 @@ def now_ms() -> int:
 class PlcWorker:
     backoff = (1, 2, 5, 10)  # seconds between reconnect attempts, the last one repeats
     missing_retry = 10  # seconds before a tag the PLC doesn't have is asked for again, unless the tag table reloads
+    group_retry = 60  # seconds before a struct whose whole read failed is read whole again, unless it reloads
 
     def __init__(self, cfg, factory, cycle_ms, on_values=None, on_status=None, on_meta=None,
                  tier2_period_s=3, grace_s=10, planner=True, whole_max_bytes=1500):
@@ -42,7 +43,8 @@ class PlcWorker:
         self._tier2 = None  # tier-2 tags in name order, None when to be rebuilt
         self._slice = 0
         self._plans = {}  # frozenset of tags -> read plan, cleared when the subscriptions or tag table change
-        self._no_group = set()  # struct paths whose whole read failed, not grouped again until a reload
+        self._no_group = {}  # lowercase struct path whose whole read failed -> monotonic time it failed
+        self._new_tier2 = set()  # tags just added at tier 2: read in the next cycle, then in their slice
         self.cache = {}  # tag -> [value, quality, t]
         self.missing = {}  # tag -> monotonic time to ask for it again; skipped until then
         self.writes = queue.Queue()  # (tag, value, Future)
@@ -113,7 +115,11 @@ class PlcWorker:
             self.cache.pop(tag, None)
             self.missing.pop(tag, None)
         else:
+            if tier == 2 and self.tiers.get(tag) in (None, 3):  # never read yet: once now, not a period later
+                self._new_tier2.add(tag)
             self.tiers[tag] = tier
+        if tier != 2:
+            self._new_tier2.discard(tag)
         self._tier2 = None
         self._plans.clear()
 
@@ -131,6 +137,9 @@ class PlcWorker:
             i = self._slice % slices
             self._slice += 1
             tags += self._tier2[i * size:(i + 1) * size]
+        if self._new_tier2:
+            tags += sorted(self._new_tier2 - set(tags))
+            self._new_tier2.clear()
         return [tag for tag in tags if self.missing.get(tag, 0) <= now]
 
     def snapshot(self, tags) -> dict:
@@ -223,18 +232,26 @@ class PlcWorker:
         if not self.planner or not hasattr(plc, "get_tag_info"):
             reads = [(tag, [(tag, None)]) for tag in tags]
         else:
+            now = time.monotonic()
+            retry = [name for name, failed_at in self._no_group.items() if now - failed_at >= self.group_retry]
+            if retry:  # read those whole again
+                for name in retry:
+                    del self._no_group[name]
+                self._plans.clear()
             key = frozenset(tags)
             reads = self._plans.get(key)
             if reads is None:
                 if len(self._plans) > 100:  # tier-2 slices make a few sets per subscription change
                     self._plans.clear()
-                reads = planner.plan(tags, plc.get_tag_info, self.whole_max_bytes, frozenset(self._no_group))
+                budget = getattr(plc, "connection_size", None)
+                budget = budget if isinstance(budget, int) and budget > 0 else planner.PACKET_BYTES
+                reads = planner.plan(tags, plc.get_tag_info, self.whole_max_bytes, frozenset(self._no_group), budget)
                 self._plans[key] = reads
         results, failed, services = planner.execute(plc, reads)
         if failed:
             self.group_fallbacks += len(failed)
             log.warning("%s: whole read of %s failed, reading the members instead", self.name, ", ".join(failed))
-            self._no_group.update(name.lower() for name in failed)
+            self._no_group.update((name.lower(), time.monotonic()) for name in failed)
             self._plans.clear()
         return results, services
 

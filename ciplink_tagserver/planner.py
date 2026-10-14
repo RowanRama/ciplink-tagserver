@@ -1,15 +1,29 @@
 """Read planner: one read of a struct instead of several reads of its members, which are sliced out of it.
 
-A poll costs about 12 ms per packet plus 1.35 ms per read service, so fewer reads beat fewer bytes. For the
-tags of one cycle, members of the same struct (a tag, an array element or a nested member) are read through
-the smallest such struct that holds at least two of them and is at most ``whole_max_bytes``. A requested tag
-that is a whole struct is read anyway, so the tags below it are sliced out of it at no cost.
+A poll costs about 12 ms per packet plus 1.35 ms per read service, so fewer reads matter, but an extra
+packet costs far more than a few reads. For the tags of one cycle, a struct (a tag, an array element or a
+nested member, at most ``whole_max_bytes``) replaces the reads of the tags under it when that pays: groups are
+taken best first by extra reply bytes per read saved, each only if it costs at most ``BYTES_PER_READ`` extra
+reply bytes per read saved and the cycle's estimated packet count does not grow over plain reads.
 """
 
+import math
 import re
 from collections import defaultdict
 
 from ciplink import Tag
+
+try:
+    from ciplink.packets.logix import TagTableVersionRequestPacket as _Version
+
+    VERSION_REQUEST, VERSION_REPLY = _Version.request_size, _Version.reply_size
+except (ImportError, AttributeError):  # an older ciplink: no tag table version check per packet
+    VERSION_REQUEST = VERSION_REPLY = 0
+
+BYTES_PER_READ = 450  # one read service (~1.35 ms) costs about as much packet time as this many reply bytes
+PACKET_BYTES = 4000  # request and reply budget of a packet when the driver has no connection_size
+ATOMIC_SIZES = {"BOOL": 1, "SINT": 1, "USINT": 1, "BYTE": 1, "INT": 2, "UINT": 2, "WORD": 2, "DINT": 4,
+                "UDINT": 4, "DWORD": 4, "REAL": 4, "LINT": 8, "ULINT": 8, "LWORD": 8, "LREAL": 8}
 
 _TOKEN = re.compile(r"(?P<name>\.?[A-Za-z_][A-Za-z0-9_]*)|\[(?P<index>\d+(?:,\d+)*)\]")
 
@@ -76,10 +90,54 @@ def _struct_size(info, last_key, memo):
     return (data_type.get("template") or {}).get("structure_size")
 
 
-def plan(tags, get_info, whole_max_bytes, no_group=frozenset()):
+def request_size(name) -> int:
+    """Estimated size of a Read Tag service for ``name``, the base tag addressed by its instance ID."""
+    tokens = tokenize(name)
+    if tokens is None:
+        return 10 + len(name) + len(name) % 2
+    size = 4 + 6  # service, path size, element count; class and instance segments
+    if tokens[0][0].lower().startswith("program:"):
+        program = tokens[0][0].split(".")[0]
+        size += 2 + len(program) + len(program) % 2
+    for _, key in tokens[1:]:
+        if isinstance(key, str):
+            size += 2 + len(key) + len(key) % 2
+        else:
+            size += sum(2 if i < 256 else 4 for i in (key if isinstance(key, tuple) else (key,)))
+    return size
+
+
+def reply_size(info) -> int:
+    """Estimated reply size of a read of one element of the tag ``info`` defines (12 when unknown)."""
+    if info is None:
+        return 12
+    if info.get("tag_type") == "struct":
+        data_type = info.get("data_type")
+        size = (data_type.get("template") or {}).get("structure_size") if isinstance(data_type, dict) else None
+        return (size or 4) + 10
+    return ATOMIC_SIZES.get(info.get("data_type_name") or info.get("data_type"), 4) + 8
+
+
+def packets(sizes, budget=PACKET_BYTES) -> int:
+    """Packets for reads of these (request, reply) sizes, packed in order as ciplink does."""
+    empty_request, empty_reply = 10 + VERSION_REQUEST, 8 + VERSION_REPLY
+    count, request, reply = 0, empty_request, empty_reply
+    for req, rep_ in sizes:
+        if empty_request + req > budget or empty_reply + rep_ > budget:  # fragmented: packets of its own
+            count += math.ceil(rep_ / (budget - empty_reply))
+            continue
+        if request + req > budget or reply + rep_ > budget:
+            count += 1
+            request, reply = empty_request, empty_reply
+        request += req
+        reply += rep_
+    return count + (1 if request > empty_request else 0)
+
+
+def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BYTES):
     """The reads for ``tags``: [(read name, [(tag, path)])], path being the keys that slice the tag's value
     out of the read value, or None for the value as read. ``get_info(name)`` is the driver's tag definition,
-    None if unknown. Names in ``no_group`` (lowercase) are not read whole."""
+    None if unknown. Names in ``no_group`` (lowercase) are not read whole. ``budget``: bytes per packet."""
     infos = {}
 
     def info(name):
@@ -127,51 +185,59 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset()):
                 continue
             depth[tag][key] = k
             names.setdefault(key, prefix)
+            sizes[key] = size
             if k == n:
                 whole[key] = tag
             else:
                 found.append(key)
-                sizes[key] = size
         ancestors[tag] = found
 
-    # tags under a requested whole struct come free with it; the others are the units to group
-    covered = {tag: next((k for k in found if k in whole), None) for tag, found in ancestors.items()}
-    under = defaultdict(int)
+    under = defaultdict(set)  # key -> the tags it can serve
     for tag, found in ancestors.items():
-        if covered[tag] is None:
-            for key in found:
-                under[key] += 1
-    assign = {}
-    for tag, found in ancestors.items():
-        if covered[tag] is not None:
-            assign[tag] = covered[tag]
-        else:
-            assign[tag] = next((k for k in found if sizes[k] <= whole_max_bytes and under[k] >= 2), None)
-            if assign[tag] is None and tag.lower() in whole:
-                assign[tag] = tag.lower()
+        for key in found:
+            under[key].add(tag)
+    for key, tag in whole.items():
+        under[key].add(tag)
+    candidates = {key for key, served in under.items()
+                  if len(served) >= 2 and (key in whole or sizes[key] <= whole_max_bytes)}
 
-    def final(tag):
-        key = assign[tag]
-        while key is not None and key in whole and whole[key] != tag and assign[whole[key]] != key:
-            tag, key = whole[key], assign[whole[key]]
-        return key
+    # reads: [key or None, members, (request, reply)], in the order they are sent; start with plain reads
+    reads = [[None, [tag], (request_size(tag), reply_size(info(tag) if tag in parsed else None))] for tag in tags]
+    limit = packets([r[2] for r in reads], budget)
+    while candidates:
+        best = None
+        for key in candidates:
+            covered = [i for i, r in enumerate(reads) if all(t in under[key] for t in r[1])]
+            if len(covered) < 2:
+                continue
+            saved = len(covered) - 1
+            group = (request_size(names[key]), sizes[key] + 10)
+            extra = group[1] - sum(reads[i][2][1] for i in covered)
+            if extra > BYTES_PER_READ * saved:
+                continue
+            members = [t for i in covered for t in reads[i][1]]
+            new = [r for i, r in enumerate(reads) if i not in covered[1:]]
+            new[covered[0]] = [key, members, group]
+            if packets([r[2] for r in new], budget) > limit:
+                continue
+            score = (extra / saved, -saved, key)
+            if best is None or score < best[0]:
+                best = (score, key, new)
+        if best is None:
+            break
+        _, key, reads = best
+        candidates.discard(key)
 
-    groups = defaultdict(list)
-    for tag in ancestors:
-        key = final(tag)
-        if key is not None:
-            groups[key].append(tag)
-    result, grouped = [], set()
-    for key, members in groups.items():
-        if len(members) == 1 and whole.get(key) != members[0]:
-            continue  # a group of one is just a bigger read
+    result = []
+    for key, members, _ in reads:
+        if key is None:
+            result.append((members[0], [(members[0], None)]))
+            continue
         entries = []
         for tag in members:
             k = depth[tag][key]
             entries.append((tag, None if k == len(parsed[tag]) else [key_ for _, key_ in parsed[tag][k:]]))
-            grouped.add(tag)
         result.append((names[key], entries))
-    result += [(tag, [(tag, None)]) for tag in tags if tag not in grouped]
     return result
 
 

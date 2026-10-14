@@ -38,15 +38,47 @@ def test_tier1_every_cycle_tier2_round_robin_tier3_never():
         w.add_tags(["C"], 3)
 
     # 100 ms cycles, 0.5 s period: 5 slices of 2
-    worker = run_cycles(fake, 20, setup, tier2_period_s=0.5)
-    reads = fake.reads[:20]
+    worker = run_cycles(fake, 21, setup, tier2_period_s=0.5)
+    assert sorted(fake.reads[0]) == sorted(["A", *t2])  # new tier-2 tags are read once at once
+    reads = fake.reads[1:21]
     assert all("A" in r for r in reads)
-    assert not any("C" in r for r in reads)
-    for i in range(0, 20, 5):  # every tier-2 tag once per 5 cycles
+    assert not any("C" in r for r in fake.reads)
+    for i in range(0, 20, 5):  # then every tier-2 tag once per 5 cycles
         window = [t for r in reads[i:i + 5] for t in r if t.startswith("B")]
         assert sorted(window) == sorted(t2)
     assert all(len(r) == 3 for r in reads)
     assert worker.tags_per_cycle == 3 and worker.tier_counts() == {"tier1": 1, "tier2": 10, "tier3": 1}
+
+
+def test_a_new_tier2_tag_is_read_in_the_next_cycle_then_in_its_slice():
+    worker = PlcWorker(PlcConfig("P", "x"), None, 100, tier2_period_s=10)  # 100 slices
+    worker.add_tags([f"B{i}" for i in range(5)], 2)
+    now = time.monotonic()
+    assert len(worker._cycle_tags(now)) == 5
+    assert len(worker._cycle_tags(now)) <= 1
+    worker.add_tags(["New"], 2)
+    assert "New" in worker._cycle_tags(now)
+    worker.set_tier("Up", 1)
+    worker.set_tier("Up", 2)  # was read every cycle: no extra read
+    assert "New" not in worker._cycle_tags(now) and "Up" not in worker._cycle_tags(now)
+
+
+def test_failed_group_is_read_whole_again_after_group_retry(monkeypatch):
+    monkeypatch.setattr(PlcWorker, "group_retry", 1.0)
+    fake = FakePLC()
+    plant(fake)
+    fake.errors["Program:Station1.Motor"] = "General error"
+    worker = PlcWorker(PlcConfig("P", "x"), lambda cfg: FakeDriver(fake), 10)
+    worker.add_tags(["Program:Station1.Motor.Speed", "Program:Station1.Motor.Current"])
+    worker.start()
+    wait_for(lambda: worker.group_fallbacks == 1)
+    failed_at = time.monotonic()
+    del fake.errors["Program:Station1.Motor"]
+    wait_for(lambda: worker.reads_per_cycle == 2)  # members one by one meanwhile
+    wait_for(lambda: worker.reads_per_cycle == 1)  # whole again after group_retry
+    assert time.monotonic() - failed_at > 0.9
+    assert worker.group_fallbacks == 1
+    worker.stop()
 
 
 def test_grace_demotion():

@@ -130,8 +130,9 @@ every cycle:
 | 2 | round robin, each tag about every `tier2_period_s`: what is likely next (a cycle reads all of tier 1 and the next slice of tier 2) |
 | 3 | never: accepted and kept, not polled |
 
-A tag's tier is the lowest among its subscriptions. When its last tier-1 subscription ends it is read at
-tier 2 for `grace_s` more, so going back to a page finds fresh values, then it drops out (or to tier 3).
+A tag's tier is the lowest among its subscriptions. A tag new at tier 2 is read once in the next cycle,
+then in its slice. When its last tier-1 subscription ends it is read at tier 2 for `grace_s` more, so
+going back to a page finds fresh values, then it drops out (or to tier 3).
 
 **Pages.** A tier-1 `sub` carrying `"page": "/line1"` (the client's current route) teaches the server that
 page's tags; it keeps the union per page in `pages_file` (saved a moment after a change, by an atomic
@@ -139,15 +140,23 @@ rename, and loaded at startup). A `sub` with a `page` and no `tags` subscribes t
 page, at its `tier` (2 for a link to it); it is empty until the page has been visited, and follows what the
 page learns. Its values are keyed by the plain tag names with one PLC, else by qualified names.
 
-**Read planner.** Each cycle, members of the same struct are read through one read of that struct and
+Known limits: a page's learned list only grows (a tag removed from a page, or deleted from the PLC, stays
+listed until you edit or delete `pages_file`), and a tier-1 subscription re-sent after the route changed
+(say, a component that stays mounted across pages) teaches the new page its tags too.
+
+**Read planner.** Each cycle, members of the same struct can be read through one read of that struct and
 sliced out of it: for `Line1.Motor.Speed` and `Line1.Motor.Current`, `Line1.Motor` is read once. The
-struct is the smallest one (a tag, an array element like `Arr[3]`, or a nested member, also in program
-scope) holding two or more of the cycle's tags, of at most `whole_max_bytes`. A tag that is itself a
-whole struct is the read for the tags under it. Never grouped: bit access (`X.Count.5`), several
-elements (`X{3}`), whole arrays, strings, BOOL arrays, and AOIs (or structs holding one) that cannot be
-read whole. If a struct read fails, its members are read one by one in the same cycle and that struct is
-not read whole again until the tag table reloads (`group_fallbacks`). Clients get the same values either
-way; `planner = false` turns it off.
+struct can be a tag, an array element like `Arr[3]`, or a nested member, also in program scope, of at
+most `whole_max_bytes`. An extra packet costs far more than a few reads, so the planner estimates each
+read's request and reply bytes and takes groups best first (fewest extra reply bytes per read saved), each
+only if it adds at most 450 reply bytes per read saved (about the packet time of one read) and the
+cycle's estimated packet count (packed as ciplink packs them, in the driver's `connection_size`, else
+4000 bytes) stays what plain reads would take. A group can grow into its parent struct under the same
+rules. A tag that is itself a whole struct is read anyway, so the tags under it come free. Never grouped:
+bit access (`X.Count.5`), several elements (`X{3}`), whole arrays, strings, BOOL arrays, and AOIs (or
+structs holding one) that cannot be read whole. If a struct read fails, its members are read one by one in
+the same cycle, and that struct is read whole again only after 60 s or a tag table reload
+(`group_fallbacks`). Clients get the same values either way; `planner = false` turns it off.
 
 ## HTTP
 
