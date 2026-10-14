@@ -176,7 +176,13 @@ describe("connection", () => {
   it("marks values stale while disconnected and resubscribes on reconnect", async () => {
     vi.useFakeTimers();
     function State() {
-      return <span data-testid="state">{useTagServer().state}</span>;
+      const { state, plcs } = useTagServer();
+      return (
+        <>
+          <span data-testid="state">{state}</span>
+          <span data-testid="plc">{plcs.PLC1}</span>
+        </>
+      );
     }
     wrap(
       <>
@@ -190,12 +196,14 @@ describe("connection", () => {
     first.drop();
     expect(text("A")).toBe("5|stale");
     expect(text("state")).toBe("disconnected");
+    expect(text("plc")).toBe("unknown"); // not "connected" while the server is unreachable
 
     act(() => vi.advanceTimersByTime(1000));
     expect(FakeWebSocket.all).toHaveLength(2);
     await connect();
     expect(last().ops("sub")).toEqual([{ op: "sub", id: 1, tags: ["A"], tier: 1 }]);
     expect(text("state")).toBe("connected");
+    expect(text("plc")).toBe("connected");
 
     // backoff grows 1, 2, 5, 10 s while it keeps failing
     last().drop();

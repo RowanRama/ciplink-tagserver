@@ -213,14 +213,16 @@ export class TagStore {
     };
   }
 
-  /** Marks every value stale (keeping it) and fails the writes in flight. */
+  /** Marks every value stale (keeping it), the PLC states unknown, and fails the writes in flight. */
   private lost(state: ConnectionState) {
     for (const [name, entry] of this.values) {
       if (entry.quality !== "stale") this.set(name, { ...entry, quality: "stale" });
     }
     for (const resolve of this.writes.values()) resolve({ ok: false, error: "disconnected" });
     this.writes.clear();
-    this.setInfo({ state });
+    // without the server we can't know the PLCs' states, so don't keep showing "connected"
+    const plcs = Object.fromEntries(Object.keys(this.info.plcs).map((name) => [name, "unknown"]));
+    this.setInfo({ state, plcs });
   }
 
   private send(message: object) {
