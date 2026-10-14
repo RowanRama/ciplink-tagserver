@@ -1,0 +1,76 @@
+"""Reads the TOML config file."""
+
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class PlcConfig:
+    name: str
+    path: str
+    tag_cache_file: str | None = None
+    mock_tags: str | None = None
+
+
+@dataclass
+class TokenConfig:
+    name: str
+    secret: str
+    write: list[str] = field(default_factory=list)  # fnmatch patterns on qualified names
+
+
+@dataclass
+class Config:
+    host: str = "127.0.0.1"
+    port: int = 8765
+    cycle_ms: int = 250
+    audit_log: str = "audit.log"
+    plcs: dict[str, PlcConfig] = field(default_factory=dict)
+    tokens: dict[str, TokenConfig] = field(default_factory=dict)
+
+    def qualify(self, name: str) -> tuple[str, str]:
+        """Splits ``<plc>/<tag>`` into (plc, tag); an unqualified name means the only PLC, if there is one."""
+        if "/" in name:
+            plc, tag = name.split("/", 1)
+            if plc not in self.plcs:
+                raise ValueError(f"unknown PLC {plc!r}")
+        elif len(self.plcs) == 1:
+            plc, tag = next(iter(self.plcs)), name
+        else:
+            raise ValueError(f"tag {name!r} must be qualified as <plc>/<tag>")
+        if not tag:
+            raise ValueError(f"empty tag name in {name!r}")
+        return plc, tag
+
+
+def load_config(path) -> Config:
+    path = Path(path)
+    with open(path, "rb") as file:
+        return parse_config(tomllib.load(file), path.parent)
+
+
+def parse_config(data: dict, base_dir=".") -> Config:
+    """Builds a Config from the parsed TOML; relative file paths are relative to ``base_dir``."""
+    base = Path(base_dir)
+
+    def resolve(value):
+        return str(base / value) if value else None
+
+    server = data.get("server", {})
+    config = Config(
+        host=server.get("host", "127.0.0.1"),
+        port=server.get("port", 8765),
+        cycle_ms=server.get("cycle_ms", 250),
+        audit_log=resolve(server.get("audit_log", "audit.log")),
+    )
+    for name, plc in data.get("plc", {}).items():
+        config.plcs[name] = PlcConfig(
+            name=name,
+            path=plc["path"],
+            tag_cache_file=resolve(plc.get("tag_cache_file")),
+            mock_tags=resolve(plc.get("mock_tags")),
+        )
+    for name, token in data.get("token", {}).items():
+        config.tokens[name] = TokenConfig(name=name, secret=token["secret"], write=list(token.get("write", [])))
+    return config

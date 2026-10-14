@@ -1,0 +1,7 @@
+{
+  "Line1.Station1.SpeedSP": "REAL",
+  "Line1.Station1.Speed": "REAL",
+  "Line1.Running": "BOOL",
+  "PartCount": "DINT",
+  "Program:Station1.DoorOpen": "BOOL"
+}

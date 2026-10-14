@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ciplink-tagserver"
+version = "0.1.0"
+description = "One server per site that owns the PLC connections and serves tag values over a WebSocket"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rowan Ramamurthy" }]
+requires-python = ">=3.11"
+dependencies = [
+    "ciplink>=0.1,<0.2",
+    "fastapi",
+    "uvicorn[standard]",
+]
+
+[project.scripts]
+ciplink-tagserver = "ciplink_tagserver.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-timeout", "httpx"]
+
+[tool.setuptools]
+packages = ["ciplink_tagserver"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
