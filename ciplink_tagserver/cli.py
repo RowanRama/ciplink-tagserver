@@ -1,8 +1,10 @@
-"""ciplink-tagserver run | dump-tags | types"""
+"""ciplink-tagserver run | dump-tags | types | service"""
 
 import argparse
 import json
 import logging
+import logging.handlers
+from pathlib import Path
 import urllib.parse
 import urllib.request
 
@@ -16,7 +18,30 @@ def run(args):
     from .server import create_app
 
     config = load_config(args.config)
-    uvicorn.run(create_app(config, mock=args.mock), host=config.host, port=config.port)
+    log_config = None if args.log_file else uvicorn.config.LOGGING_CONFIG  # with a log file, uvicorn logs go there too
+    uvicorn.run(create_app(config, mock=args.mock), host=config.host, port=config.port, log_config=log_config)
+
+
+def service(args):
+    from . import service as svc
+
+    config = Path(args.config).resolve()
+    log_file = Path(args.log_file).resolve() if args.log_file else config.with_name("tagserver.log")
+    if args.action == "install":
+        return svc.install(args.name, config, log_file)
+    if args.action == "remove":
+        return svc.remove(args.name)
+    if args.action == "status":
+        return svc.status(args.name)
+    args.mock, args.config, args.log_file = False, str(config), str(log_file)
+    svc.supervise(lambda: run(args))  # "run": what the installed task executes
+
+
+def setup_logging(log_file=None):
+    handlers = [logging.StreamHandler()]
+    if log_file:
+        handlers = [logging.handlers.RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5, encoding="utf-8")]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers)
 
 
 def dump_tags(args):
@@ -71,7 +96,15 @@ def main(argv=None):
     p = commands.add_parser("run", help="serve tag values over a WebSocket")
     p.add_argument("--config", default="tagserver.toml")
     p.add_argument("--mock", action="store_true", help="serve fake values from each PLC's mock_tags file")
+    p.add_argument("--log-file", help="write logs to this file (rotated at 10 MB, 5 kept) instead of the console")
     p.set_defaults(func=run)
+
+    p = commands.add_parser("service", help="run at Windows startup (install/remove need an administrator terminal)")
+    p.add_argument("action", choices=["install", "remove", "status", "run"])
+    p.add_argument("--config", default="tagserver.toml")
+    p.add_argument("--name", default="ciplink-tagserver", help="Task Scheduler task name")
+    p.add_argument("--log-file", help="default: tagserver.log next to the config")
+    p.set_defaults(func=service)
 
     p = commands.add_parser("dump-tags", help="write a PLC's tag list as a mock_tags file")
     p.add_argument("--config", default="tagserver.toml")
@@ -87,9 +120,9 @@ def main(argv=None):
     p.set_defaults(func=types)
 
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    args.func(args)
+    setup_logging(getattr(args, "log_file", None))
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

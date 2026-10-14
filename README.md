@@ -28,6 +28,25 @@ ciplink-tagserver types --url http://127.0.0.1:8765 --token T --plc PLC1 --out s
 `export type TagName = "Line1.Speed" | ...;`. AOIs appear as their readable members (`Valve1.Open`),
 never their local tags. Pass `--plc` once per PLC; with more than one, names are qualified (`PLC1/Line1.Speed`).
 
+Add `--log-file tagserver.log` to `run` to log to a file (rotated at 10 MB, 5 kept) instead of the console.
+
+## Run at Windows startup
+
+From an administrator terminal (right-click Terminal, "Run as administrator"):
+
+```
+ciplink-tagserver service install --config C:\TagServer\tagserver.toml
+ciplink-tagserver service status
+ciplink-tagserver service remove
+```
+
+`install` registers a Task Scheduler task that starts at every boot as SYSTEM, without anyone logging in,
+and starts it now. The task runs `ciplink-tagserver service run`, which starts the server again 5 s after
+it stops for any reason; Task Scheduler also restarts the task itself if it fails. Logs go to
+`tagserver.log` next to the config (`--log-file` to change it). Use full paths in the config, or paths
+relative to it; the task runs in the config's folder. `--name` sets the task name (default
+`ciplink-tagserver`), so several servers can run on one PC with different configs and ports.
+
 ## Config
 
 ```toml
