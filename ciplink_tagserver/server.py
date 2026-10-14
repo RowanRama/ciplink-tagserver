@@ -165,8 +165,7 @@ class Hub:
             for name in names:
                 plc, tag = self.config.qualify(name)
                 tags[f"{plc}/{tag}"] = name
-        if sub_id in session.subs:
-            self.unsubscribe(session, sub_id)
+        old = session.subs.pop(sub_id, None)  # replaced: released after the new one counts, so no tag drops out
         session.subs[sub_id] = {"tier": tier, "tags": tags, "follow": follow}
         snapshot = {}
         for qname, name in tags.items():
@@ -179,6 +178,8 @@ class Hub:
             entry = self.workers[plc].snapshot([tag]).get(tag)
             if entry is not None:
                 snapshot[name] = entry
+        if old is not None:
+            self._release(old)
         if page is not None and follow is None and tier == 1:
             self._learn(page, tags)
         return snapshot
@@ -187,6 +188,10 @@ class Hub:
         sub = session.subs.pop(sub_id, None)
         if sub is None:
             return False
+        self._release(sub)
+        return True
+
+    def _release(self, sub):
         for qname in sub["tags"]:
             counts = self.refs[qname]
             before = min(counts)
@@ -199,7 +204,6 @@ class Hub:
             if after != before:
                 plc, tag = qname.split("/", 1)
                 self.workers[plc].set_tier(tag, after)
-        return True
 
     def _client_name(self, qname):
         """How a page subscription names a learned tag: unqualified when there is only one PLC."""
