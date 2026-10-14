@@ -21,7 +21,12 @@ or from a checkout with [uv](https://docs.astral.sh/uv/): `uv sync`, then `uv ru
 ciplink-tagserver run --config tagserver.toml          # real PLCs
 ciplink-tagserver run --config tagserver.toml --mock   # fake values, no PLC needed
 ciplink-tagserver dump-tags --config tagserver.toml --plc PLC1 --out PLC1_tags.json
+ciplink-tagserver types --url http://127.0.0.1:8765 --token T --plc PLC1 --out src/tags.d.ts
 ```
+
+`types` asks a running server for its tag list (`GET /tags`) and writes a TypeScript union,
+`export type TagName = "Line1.Speed" | ...;`. AOIs appear as their readable members (`Valve1.Open`),
+never their local tags. Pass `--plc` once per PLC; with more than one, names are qualified (`PLC1/Line1.Speed`).
 
 ## Config
 
@@ -95,6 +100,32 @@ Server to client:
 - `GET /stats`: `sessions`, and per PLC `reads_per_cycle`, `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`.
 - `GET /tags?plc=NAME` with `Authorization: Bearer <secret>`: the PLC's tags with data type and, for
   AOIs, `aoi_readable` (the members that can be read). `plc` may be left out with one PLC.
+
+## React
+
+[`@ciplink/react`](client/) (in `client/`) is the React side: one provider that owns the WebSocket, and
+hooks and components that subscribe while mounted.
+
+```tsx
+import { TagServerProvider, TagValue, TagLamp, useWriteTag, useTagServer } from "@ciplink/react";
+
+<TagServerProvider url="ws://127.0.0.1:8765/ws" token="change-me">
+  <TagValue name="Line1.Station1.Speed" decimals={1} unit="m/min" />
+  <TagLamp name="Line1.Running" />
+</TagServerProvider>
+```
+
+- `useTag(name)` gives `{value, quality, t}` and re-renders only when that tag changes; subscriptions are
+  counted across components and batched.
+- `useTags(names)`, `useWriteTag(name)` (resolves with the write's ack), `useTagServer()` (connection
+  state, PLC states, `canWrite`).
+- `<TagValue>` and `<TagLamp>` are fixed width with a quality marker, so nothing moves as values change.
+- `<TagLink to as?>` prefetches the tags of a page registered with `registerPage(path, tags)`.
+- Reconnects after 1, 2, 5, then every 10 s, re-subscribes, and shows values as `stale` meanwhile.
+
+A runnable app is in [`examples/react-app/`](examples/react-app/): start the server with
+`uv run ciplink-tagserver run --config examples/tagserver.toml --mock`, build `client/` once
+(`npm install && npm run build`), then `npm install && npm run dev` in the example.
 
 ## Mock mode
 
