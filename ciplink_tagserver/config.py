@@ -4,6 +4,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .rules import Resolver
+
 
 @dataclass
 class PlcConfig:
@@ -13,6 +15,8 @@ class PlcConfig:
     mock_tags: str | None = None
     rules: list[dict] = field(default_factory=list)  # [[plc.X.rule]] tables in file order, see rules.py
     groups: list[dict] = field(default_factory=list)  # [[plc.X.group]] tables: name, rate_ms, match
+    udt: dict = field(default_factory=dict)  # [plc.X.udt.UDT] tables: member -> entry, see rules.py
+    tags: dict = field(default_factory=dict)  # [plc.X.tags]: tag path -> entry
 
 
 @dataclass
@@ -36,6 +40,7 @@ class Config:
     momentary_timeout_ms: int = 1000  # a pressed momentary tag with no hold this long is released
     plcs: dict[str, PlcConfig] = field(default_factory=dict)
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
+    decorators: dict[str, dict] = field(default_factory=dict)  # [decorator.NAME] tables
 
     def qualify(self, name: str) -> tuple[str, str]:
         """Splits ``<plc>/<tag>`` into (plc, tag); an unqualified name means the only PLC, if there is one."""
@@ -55,7 +60,11 @@ class Config:
 def load_config(path) -> Config:
     path = Path(path)
     with open(path, "rb") as file:
-        return parse_config(tomllib.load(file), path.parent)
+        data = tomllib.load(file)
+    try:
+        return parse_config(data, path.parent)
+    except ValueError as err:
+        raise ValueError(f"{path}: {err}") from None
 
 
 def parse_config(data: dict, base_dir=".") -> Config:
@@ -77,6 +86,7 @@ def parse_config(data: dict, base_dir=".") -> Config:
         planner=server.get("planner", True),
         whole_max_bytes=server.get("whole_max_bytes", 1500),
         momentary_timeout_ms=server.get("momentary_timeout_ms", 1000),
+        decorators=dict(data.get("decorator", {})),
     )
     for name, plc in data.get("plc", {}).items():
         config.plcs[name] = PlcConfig(
@@ -86,7 +96,10 @@ def parse_config(data: dict, base_dir=".") -> Config:
             mock_tags=resolve(plc.get("mock_tags")),
             rules=list(plc.get("rule", [])),
             groups=list(plc.get("group", [])),
+            udt=dict(plc.get("udt", {})),
+            tags=dict(plc.get("tags", {})),
         )
+        Resolver(config.decorators, plc.get("udt"), plc.get("tags"), where=f"plc.{name}")  # unknown decorators etc.
         for group in config.plcs[name].groups:
             rate = group.get("rate_ms")
             if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0 or "name" not in group:

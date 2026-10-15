@@ -8,7 +8,7 @@ It is built on [ciplink](https://pypi.org/project/ciplink/), a fork of pycomm3 t
 ID and reloads its tag table by itself after online edits. 0.3 needs ciplink 0.2.
 
 **Structure** (tags, types, UDTs) always comes from the controller. **Intent** (what may be written, limits,
-units, deadband, bit names, poll rates) comes from rules in the config. Nothing is declared twice: the
+units, deadband, bit names, poll rates) comes from decorators in the config. Nothing is declared twice: the
 TypeScript tag tree is generated from the running server.
 
 ## Install
@@ -79,9 +79,11 @@ path = "192.168.1.10"                # a ciplink/pycomm3 path, e.g. "10.0.0.5/1/
 tag_cache_file = "cache/PLC1.json"   # optional: fast restarts
 mock_tags = "PLC1_tags.json"         # optional: used only with --mock
 
-[[plc.PLC1.rule]]                    # see Rules
-match = "Line1.*.SpeedSP"
+[decorator.setpoint]                 # see Decorators
 writable = true
+
+[plc.PLC1.udt.MotorData]
+SpeedSP = "setpoint"
 
 [token.viewer]
 secret = "change-me-too"             # no write patterns: read-only
@@ -97,12 +99,77 @@ Relative file paths are relative to the config file. A complete example is
 **Tag names** are qualified as `<plc>/<tag>`, e.g. `PLC1/Program:Main.Speed` (a slash cannot appear
 in a Logix tag name). With exactly one PLC configured, unqualified names mean that PLC.
 
-**Patterns** (rules, poll groups, token write patterns) ignore case; `*` matches any run of characters
-(dots and brackets too), `?` one character, everything else is literal: `Tank[*].Level` matches
-`Tank[3].Level`. Rule and group patterns match the tag inside its PLC (`Tank[3].Level`); token write
-patterns match the qualified name (`PLC1/Tank[3].Level`). `match` may be one pattern or a list.
+**Patterns** (token write patterns, and the fallback rules and poll groups) ignore case; `*` matches any run
+of characters (dots and brackets too), `?` one character, everything else is literal: `Tank[*].Level` matches
+`Tank[3].Level`. Rule and group patterns match the tag inside its PLC (`Tank[3].Level`); token write patterns
+match the qualified name (`PLC1/Tank[3].Level`). `match` may be one pattern or a list.
+
+## Decorators
+
+The recommended way to give tags their settings. A decorator is a named bundle of settings, defined once and
+attached to UDT members (every instance in the controller) or to tag paths:
+
+```toml
+[decorator.temperature]
+units   = "°C"
+rate_ms = 1000
+
+[decorator.speed]
+units = "rpm"
+min   = 0
+max   = 3000
+
+[decorator.setpoint]
+writable = true
+
+[decorator.fast]
+rate_ms = 250
+
+[plc.PLC1.udt.MotorData]              # every MotorData member Temp and SpeedSP, wherever the UDT is used
+Temp    = "temperature"
+SpeedSP = { use = ["speed", "setpoint"], description = "Motor speed setpoint" }
+
+[plc.PLC1.udt.PumpData]
+Motor = "fast"                        # everything under Motor polled at 250 ms, except Temp (1000 ms)
+
+[plc.PLC1.tags]
+Pump1 = "fast"                        # a base tag
+TankLevel = "temperature"             # an array: every element too
+"Pumps[2].Motor.SpeedSP" = { max = 1500 }   # one element; "Pumps.Motor.SpeedSP" would be every element
+"Program:Main.StatusWord" = { bits = { EStop = 0, DoorOpen = 1 } }
+```
+
+- **Fields**: `units`, `min`, `max`, `deadband`, `writable`, `rate_ms`, `description`, `bits`, `together`,
+  `always` (see Rules for what each does). Unknown keys are logged and ignored.
+- **An entry** is `"name"`, `["name", ...]` or `{ use = "name" | [...], <fields> }`. Decorators apply in list
+  order (a later one wins), then the entry's own fields win over its decorators. A decorator name that is not
+  defined is an error at startup, naming the place in the file.
+- **`[plc.P.udt.UDT]`** applies to that member in every instance of the UDT: any tag, any array element, nested
+  at any depth, program scopes too. UDT and member names ignore case. UDT types come from the controller, so
+  these apply once the PLC is connected (and again after every tag table reload); until then only
+  `[plc.P.tags]` entries and rules apply.
+- **`[plc.P.tags]`** keys are tag paths: `Pump1`, `Program:Main.StatusWord`, `Pumps[2].Motor.SpeedSP`. Case and
+  index spelling are ignored. A key with indexes applies to that element; the same key without them
+  (`Pumps.Motor.SpeedSP`) applies to every element.
+- **Closest wins.** `rate_ms` and `together` pass down from a struct or array to everything under it, and the
+  setting closest to the tag wins. The other fields describe one value and never pass down to members, so a
+  writable struct does not make its members writable. An array element does take its array's fields
+  (`TankLevel[3]` is in °C).
+- **At one node**, a `[tags]` key with indexes wins over one without, which wins over the `[udt]` entry.
+- **Bits**: `X.3` takes `writable` from `X` unless set for the bit itself; bit names come from `X`'s `bits`.
+  Names set by a `[udt]` entry resolve once the PLC connects; subscriptions made before then move to the bit.
+- **`rate_ms`** works like a poll group (tier 1 only); `/stats` and info name it after the decorator that set
+  it, or `"tag"` when set in the entry itself. Tags with the same name share the stats entry.
+- **`always`** on a `[tags]` key reads that tag (every element for a key without indexes, such as
+  `Pumps.Motor.Alarm`); on a `[udt]` member it reads every instance. Both expand once the controller's types
+  are known.
+- Fields still unset after the decorators come from the rules below, then the rate from the poll groups.
+
+A complete example: [`tests/fixtures/decorators_example.toml`](tests/fixtures/decorators_example.toml).
 
 ## Rules
+
+The fallback to decorators, and how 0.3 configs set things: match patterns, read after the decorators.
 
 ```toml
 [[plc.PLC1.rule]]
@@ -128,7 +195,7 @@ together = true        # members of this struct are always read in one read: no 
 ```
 
 - Several rules can match a tag. For each field, the first rule in the file that sets it wins, so put
-  specific rules first.
+  specific rules first. A decorator setting wins over any rule.
 - A bit `X.<n>` takes only `writable` from `X`'s rules; `min`, `max`, `units`, `deadband`, `bits` never
   apply to a bit.
 - Bit names (`X.EStop`) work wherever a tag name does (sub, write, momentary). Values and acks are keyed by
@@ -136,6 +203,8 @@ together = true        # members of this struct are always read in one read: no 
 - Unknown keys are ignored.
 
 ## Poll groups
+
+The fallback to `rate_ms` in decorators: a tag with a decorator rate ignores the groups.
 
 ```toml
 [[plc.PLC1.group]]
@@ -164,7 +233,7 @@ Checked in this order, before anything is sent to the PLC; a rejected write's ac
 |---|---|
 | the name qualifies (no `{n}` element count, not a whole array: write `X[0]`) and the message is well formed (a `value`) | `bad_request` |
 | a token write pattern matches (as sent, or after bit-name resolution) | `not_allowed` |
-| the tag's rule has `writable = true` | `not_writable` |
+| the tag's settings (decorators, else rules) say `writable = true` | `not_writable` |
 | numbers (also inside lists and dicts) are within the written path's own `min`/`max` | `out_of_range` |
 | type and size, checked by ciplink per tag, nothing sent | `bad_value` |
 
@@ -195,8 +264,8 @@ The first time a connection subscribes a name, the server sends its info before 
  "min":0,"max":1800,"units":"rpm","description":"Spindle speed setpoint"}}}
 ```
 
-`type` comes from the controller (null until the PLC is connected), `writable` is true only when the rule
-says so and this connection's token may write it, `dims` is set for a whole array, `bits` on a word with bit
+`type` comes from the controller (null until the PLC is connected), `writable` is true only when the settings
+say so and this connection's token may write it, `dims` is set for a whole array, `bits` on a word with bit
 names. Bits and bit names are `BOOL`. Info is sent again after a tag table reload and when a PLC connects.
 
 ## Codegen: the typed tag tree
@@ -211,11 +280,12 @@ UDT, a `PLC1Tags` interface of the controller and `Program:` scopes, and `export
 ```ts
 import { PLC1 } from "./plc";
 <TagValue name={PLC1.Tank[2].Level} />          // "Tank[2].Level"
-<NumericInput name={PLC1.Bench.SpeedSP} />       // compiles only if the rule makes it writable
-<TagLamp name={PLC1.Bench.StatusWord.EStop} />   // bit names from the rules; .bit(3) for any bit
+<NumericInput name={PLC1.Bench.SpeedSP} />       // compiles only if its settings make it writable
+<TagLamp name={PLC1.Bench.StatusWord.EStop} />   // bit names from the settings; .bit(3) for any bit
 ```
 
-Leaves are `TagRef<number|boolean|string, W>`, with `W` true where a rule makes the path writable, so
+Leaves are `TagRef<number|boolean|string, W>`, with `W` true where the settings make the path writable (the
+server's own resolution of decorators and rules, from `/tags`), so
 `useWriteTag`, `NumericInput` and `MomentaryButton` reject read-only tags at compile time. Arrays are
 `TagArray<T, N>` with a literal `length`, not refs: a bare array name reads and writes only its first
 element, so use `Trend[0]`. The header gives the tag table version: run it again after a
@@ -246,7 +316,7 @@ JSON messages over `ws://host:port/ws`. Every 0.3 addition is optional, so 0.2 c
   failed: the **last value is kept**); `stale` (PLC disconnected: last value kept). `error` is null when good,
   else `{"kind": "...", "message": "..."}` with ciplink's kinds (`not_found`, `access`, `comm`, ...).
 - Values: structs are objects, arrays lists, bytes hex strings, NaN and infinities the strings `"NaN"`,
-  `"Infinity"`, `"-Infinity"`. `t` is ms since the epoch. A numeric change below the rule's `deadband` is not sent.
+  `"Infinity"`, `"-Infinity"`. `t` is ms since the epoch. A numeric change below the tag's `deadband` is not sent.
 - Writes and reconnects: see Writes. Reconnects back off 1, 2, 5, then every 10 s.
 
 `tests/conformance/` checks a server against this table over a real WebSocket (an in-process `--mock` Test
@@ -296,7 +366,8 @@ in the same cycle, and the struct is tried whole again after 60 s or a reload (`
   `tags_per_cycle`, `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`, `tier1`, `tier2`, `tier3`,
   `group_fallbacks` and `groups`.
 - `GET /tags?plc=NAME` with `Authorization: Bearer <secret>`: `{plc, state, version, tags: [{name, type,
-  dims?, aoi_readable?}], types: {UDT: {members: {m: {type, dims?}}}}, rules, groups}`. Strings show as type
+  dims?, aoi_readable?}], types: {UDT: {members: {m: {type, dims?}}}}, rules, groups, decorators, udt,
+  tag_settings}` (`tag_settings` is the PLC's `[plc.P.tags]` table). Strings show as type
   `STRING`. `plc` may be left out with one PLC. CORS allows GET from any origin (the TagBrowser fetches it).
 
 ## React
@@ -354,7 +425,7 @@ names are `missing`. `dump-tags` writes a flat file from a real PLC's tag list.
 
 ## Safety
 
-- Writes are off unless a token has `write` patterns **and** a rule makes the tag `writable`.
+- Writes are off unless a token has `write` patterns **and** the tag's settings (a decorator or rule) make it `writable`.
 - Every write attempt, allowed or not, is appended to the audit log.
 - Momentary buttons are released by the server when the client stops holding them.
 - The server binds to `127.0.0.1` by default. Put it behind a TLS proxy before opening it to a network:

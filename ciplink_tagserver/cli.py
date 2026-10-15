@@ -9,8 +9,8 @@ import re
 import urllib.parse
 import urllib.request
 
-from . import rules
 from .config import load_config
+from .rules import Resolver
 from .values import type_name
 
 
@@ -59,7 +59,8 @@ def dump_tags(args):
 
 
 def fetch_tags(url, token, plc):
-    """GET <url>/tags?plc=NAME; returns the whole body (plc, version, tags, types, rules, groups)."""
+    """GET <url>/tags?plc=NAME; returns the whole body (plc, version, tags, types, rules, groups, decorators, udt,
+    tag_settings)."""
     query = f"/tags?plc={urllib.parse.quote(plc)}" if plc else "/tags"
     request = urllib.request.Request(url.rstrip("/") + query, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(request) as response:
@@ -107,19 +108,18 @@ class Scope(dict):
 
 
 class TreeGen:
-    """TS types for one PLC's /tags body. Paths go two ways: ``path`` with each index as ``[0]`` (what rules are
-    matched against, amendment 36; None inside a shared interface) and ``meta`` with each index group as ``[]``."""
+    """TS types for one PLC's /tags body. Paths go two ways: ``path`` with each index as ``[0]`` (what settings are
+    resolved for, amendment 36; None inside a shared interface) and ``meta`` with each index group as ``[]``."""
 
     def __init__(self, body):
-        self.body, self.types, self.rules = body, body.get("types") or {}, body.get("rules") or []
+        self.body, self.types = body, body.get("types") or {}
+        self.resolver = Resolver.from_body(body)  # the server's resolution: decorators, then rules
         self.prefix = ident(body["plc"])
         self.dims, self.bits = {}, {}
 
     def rule(self, path, field):
-        """The field of the first rule (file order) matching the path that sets it, else None."""
-        if path is None:
-            return None
-        return next((r[field] for r in self.rules if field in r and rules.matches(r, path)), None)
+        """The path's effective setting of the field, else None."""
+        return None if path is None else self.resolver.effective(path).get(field)
 
     def leaf(self, type_, path, meta):
         """(TS type, path specific) of an atomic, STRING or unknown leaf."""
@@ -135,7 +135,7 @@ class TreeGen:
         if meta is not None:
             self.bits[meta] = dict(bits)
         aliases = []
-        for name, n in bits.items():  # a bit's own rules first, else its word's writable
+        for name, n in bits.items():  # a bit's own settings first, else its word's writable
             bw = self.rule(f"{path}.{n}", "writable")
             aliases.append((name, f"TagRef<boolean, {ts_bool(w if bw is None else bw)}>"))
         return f"{text} & {obj(aliases)}", True

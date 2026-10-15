@@ -53,6 +53,7 @@ class PlcWorker:
         self._last_cycle = None  # clock time of the last cycle_ms boundary
         self._groups = {}  # tag -> its poll group table or None
         self._group_reads = {}  # group name -> (previous, last) clock time it was read
+        self._group_rates = {}  # group name -> rate_ms, of the groups read since the start
         self._plans = {}  # frozenset of tags -> read chunks, cleared when the subscriptions or tag table change
         self._no_group = {}  # lowercase struct path whose whole read failed -> clock time it failed
         self._new_tier2 = set()  # tags just added at tier 2: read in the next tick, then in their slice
@@ -105,7 +106,8 @@ class PlcWorker:
         return {f"tier{n}": tiers.count(n) for n in (1, 2, 3)}
 
     def group_stats(self) -> dict:
-        """{group: {rate_ms, tags (at tier 1 now), last_period_ms}} for /stats."""
+        """{group: {rate_ms, tags (at tier 1 now), last_period_ms}} for /stats: the poll groups, and the decorators
+        (or "tag" for a rate_ms set inline) whose rate a tag was read at."""
         if self.rules is None:
             return {}
         with self.lock:
@@ -115,12 +117,12 @@ class PlcWorker:
                 if group:
                     counts[group["name"]] = counts.get(group["name"], 0) + 1
             reads = dict(self._group_reads)
+            rates = {g["name"]: g["rate_ms"] for g in self.rules.groups(self.name)} | self._group_rates
         result = {}
-        for group in self.rules.groups(self.name):
-            prev, last = reads.get(group["name"], (None, None))
+        for name, rate in rates.items():
+            prev, last = reads.get(name, (None, None))
             period = round((last - prev) * 1000, 1) if prev is not None else None
-            result[group["name"]] = {"rate_ms": group["rate_ms"], "tags": counts.get(group["name"], 0),
-                                     "last_period_ms": period}
+            result[name] = {"rate_ms": rate, "tags": counts.get(name, 0), "last_period_ms": period}
         return result
 
     def add_tags(self, tags, tier=1):
@@ -202,6 +204,7 @@ class PlcWorker:
                 tags.append(tag)
                 if group := self._group(tag):
                     groups.add(group["name"])
+                    self._group_rates[group["name"]] = group["rate_ms"]
         for name in groups:
             self._group_reads[name] = (self._group_reads.get(name, (None, None))[1], now)
         if boundary:
@@ -465,7 +468,10 @@ class PlcWorker:
         if changed or connecting:
             self.tag_list = tag_list(plc)
             self.types = type_map(plc)
+            if self.rules is not None:  # UDT entries apply from now on
+                self.rules.set_types(self.name, self.tag_list, self.types)
             with self.lock:
+                self._groups.clear()
                 self.missing.clear()  # a new or renamed tag may exist now
                 self._no_group.clear()
                 self._plans.clear()  # members or struct sizes may have changed

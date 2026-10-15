@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 from collections import Counter, deque
 from concurrent.futures import Future
@@ -16,7 +15,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .rules import BIT, Rules, match
+from .rules import BIT, INDEX, Rules, canonical, match
 from .worker import PlcWorker
 
 log = logging.getLogger(__name__)
@@ -26,15 +25,6 @@ FEATURES = ["info", "momentary", "readback", "errors"]
 RELEASES = ("release", "timeout", "disconnect")
 # kinds a retry never fixes; a release failing any other way (refused, comm, table_changed, ...) is owed
 FINAL = {"bad_request", "not_allowed", "not_writable", "out_of_range", "not_found", "access", "bad_value"}
-_INDEX = re.compile(r"\[([^\]]*)\]")
-
-
-def _canonical(match):
-    """[02] and [ 2] address element 2 in ciplink and the mock (int()), so rules must see [2]."""
-    try:
-        return "[" + ",".join(str(int(i)) for i in match[1].split(",")) + "]"
-    except ValueError:
-        return match[0]
 
 
 def driver_factory(cfg):
@@ -138,10 +128,9 @@ class Hub:
                             rules=self.rules, on_info=self._on_info)
             for name, cfg in config.plcs.items()
         }
-        for plc, worker in self.workers.items():  # an internal reference that is never released
-            for tag in self.rules.always(plc):
-                self.refs[f"{plc}/{tag}"] = Counter({1: 1})
-                worker.set_tier(tag, 1)
+        self._always = {}  # plc -> its always tags, each holding one tier-1 reference
+        for plc in self.workers:
+            self._update_always(plc)
 
     def start(self, loop):
         self.loop = loop
@@ -203,16 +192,51 @@ class Hub:
         for session in self.sessions:
             session.send(message)
 
+    def _update_always(self, plc):
+        """Holds a tier-1 reference on each always tag; called again once the types are known or reloaded."""
+        new, old = set(self.rules.always(plc)), self._always.get(plc, set())
+        for tag in sorted(new - old):
+            self._hold(f"{plc}/{tag}", 1)
+        if old - new:
+            self._release({"tier": 1, "tags": {t: f"{plc}/{t}" for t in old - new}})
+        self._always[plc] = new
+
     def _status(self, plc, state):
         self._broadcast({"op": "status", "plcs": self.states()})
         if state == "connected":  # types are known now
+            self._update_always(plc)
+            self._requalify(plc)
             self._send_info(plc)
             for qname in [q for q in list(self.owed) if q.split("/", 1)[0] == plc]:
                 self._resend(qname)
 
     def _meta(self, plc):
         self._broadcast({"op": "meta", "plc": plc})
+        self._update_always(plc)
+        self._requalify(plc)
         self._send_info(plc)
+
+    def _requalify(self, plc):
+        """Resolves the subscribed names of the PLC again once its types are known or reloaded: a bit alias
+        from a [udt] entry only resolves then. A sub whose names now resolve elsewhere moves its references."""
+        for session in self.sessions:
+            for sub in session.subs.values():
+                tags = dict(sub["tags"])
+                for name, qname in sub["tags"].items():
+                    if qname.split("/", 1)[0] == plc:
+                        try:
+                            p, _, tag = self._qualify(name)
+                        except (ValueError, TypeError):
+                            continue
+                        tags[name] = f"{p}/{tag}"
+                if tags == sub["tags"]:
+                    continue
+                old, new = set(sub["tags"].values()), set(tags.values())
+                for qname in new - old:
+                    self._hold(qname, sub["tier"])
+                self._release({"tier": sub["tier"], "tags": {q: q for q in old - new}})
+                sub["tags"] = tags
+                self._reindex(session, old | new)
 
     def _send_info(self, plc, tags=None):
         """Sends the info of the PLC's subscribed names again (only of ``tags`` if given)."""
@@ -266,7 +290,7 @@ class Hub:
         if not isinstance(name, str):
             raise TypeError("tag names must be strings")
         plc, tag = self.config.qualify(name)
-        tag = _INDEX.sub(_canonical, tag)
+        tag = INDEX.sub(canonical, tag)
         return plc, tag, self.rules.resolve(plc, tag)
 
     def subscribe(self, session, sub_id, names, tier=1, page=None):
@@ -283,7 +307,7 @@ class Hub:
             if page is None:
                 raise KeyError("tags")
             follow = page
-            tags = {self._client_name(qname): qname for qname in sorted(self.pages.get(page, ()))}
+            tags = {self._client_name(qname): self._resolved(qname) for qname in sorted(self.pages.get(page, ()))}
         else:
             if not isinstance(names, list):
                 raise TypeError("tags must be a list")
@@ -294,12 +318,7 @@ class Hub:
         old = session.subs.pop(sub_id, None)  # replaced: released after the new one counts, so no tag drops out
         session.subs[sub_id] = {"tier": tier, "tags": tags, "follow": follow}
         for qname in set(tags.values()):
-            plc, tag = qname.split("/", 1)
-            counts = self.refs.setdefault(qname, Counter())
-            before = min(counts) if counts else None
-            counts[tier] += 1
-            if before is None or tier < before:
-                self.workers[plc].set_tier(tag, tier)
+            self._hold(qname, tier)
         if old is not None:
             self._release(old)
         self._reindex(session, set(tags.values()) | (set(old["tags"].values()) if old else set()))
@@ -327,6 +346,14 @@ class Hub:
         self._release(sub)
         self._reindex(session, set(sub["tags"].values()))
         return True
+
+    def _hold(self, qname, tier):
+        """One more reference at ``tier``; the worker reads the tag at the lowest tier held."""
+        counts = self.refs.setdefault(qname, Counter())
+        if not counts or tier < min(counts):
+            plc, tag = qname.split("/", 1)
+            self.workers[plc].set_tier(tag, tier)
+        counts[tier] += 1
 
     def _release(self, sub):
         for qname in set(sub["tags"].values()):
@@ -359,6 +386,11 @@ class Hub:
                     del self.subscribers[qname]
         # a name subscribed again later gets fresh info (its type may be known by then)
         session.info_sent &= {name for sub in session.subs.values() for name in sub["tags"]}
+
+    def _resolved(self, qname):
+        """A learned name with its bit alias resolved as the types now say (it may have been learned before)."""
+        plc, tag = qname.split("/", 1)
+        return f"{plc}/{self.rules.resolve(plc, tag)}"
 
     def _client_name(self, qname):
         """How a page subscription names a learned tag: unqualified when there is only one PLC."""
@@ -584,7 +616,8 @@ def create_app(config, factory=None, mock=False) -> FastAPI:
             raise HTTPException(404, f"unknown PLC {plc!r}")
         worker = hub.workers[plc]
         return {"plc": plc, "state": worker.state, "version": worker.version, "tags": worker.tag_list,
-                "types": worker.types, "rules": config.plcs[plc].rules, "groups": config.plcs[plc].groups}
+                "types": worker.types, "rules": config.plcs[plc].rules, "groups": config.plcs[plc].groups,
+                "decorators": config.decorators, "udt": config.plcs[plc].udt, "tag_settings": config.plcs[plc].tags}
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):

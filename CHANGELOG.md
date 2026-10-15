@@ -1,5 +1,26 @@
 # Changelog
 
+## ciplink-tagserver 0.4.0
+
+Needs ciplink 0.2. The protocol and `@ciplink/react` are unchanged; 0.3 configs work as before.
+
+- **Decorators**: `[decorator.NAME]` bundles of `units`, `min`, `max`, `deadband`, `writable`, `rate_ms`,
+  `description`, `bits`, `together`, `always`, attached by UDT member (`[plc.P.udt.UDT]`, every instance in the
+  controller, nested and program scopes too) or by tag path (`[plc.P.tags]`). An entry is a name, a list of
+  names or `{ use = ..., <fields> }`; later decorators win, the entry's own fields win over its decorators.
+- Resolution walks the path: `rate_ms` and `together` pass down to members (closest wins), the other fields
+  stay on their value (an array element takes its array's); at one node an indexed `[tags]` key wins over the
+  unindexed one, which wins over the `[udt]` entry. Rules and poll groups are now the fallback for fields the
+  decorators leave unset.
+- `[udt]` entries apply once the PLC is connected (they need the controller's types) and are resolved again
+  after every tag table reload, and subscribed bit names they define move to their bit then; `always` on a
+  UDT member, or on a `[tags]` key without indexes, reads every instance.
+- A decorator `rate_ms` works like a poll group, named after the decorator (`"tag"` when set inline) in
+  `/stats` and info.
+- An unknown decorator name is a startup error naming the file and place; unknown keys are logged and ignored.
+- `GET /tags` adds `decorators`, `udt` and `tag_settings` (the `[plc.P.tags]` table); `types` codegen types
+  `writable` with the server's own resolution.
+
 ## ciplink-tagserver 0.3.0 / @ciplink/react 0.3.0
 
 Needs ciplink 0.2 (`ciplink>=0.2,<0.3`). The protocol stays v1: every addition is optional, so 0.2 clients keep
