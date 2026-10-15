@@ -5,7 +5,11 @@ over a WebSocket. Apps never talk to the PLCs: each PLC gets one connection, one
 loop, however many screens are open.
 
 It is built on [ciplink](https://pypi.org/project/ciplink/), a fork of pycomm3 that reads by instance
-ID and reloads its tag table by itself after online edits.
+ID and reloads its tag table by itself after online edits. 0.3 needs ciplink 0.2.
+
+**Structure** (tags, types, UDTs) always comes from the controller. **Intent** (what may be written, limits,
+units, deadband, bit names, poll rates) comes from rules in the config. Nothing is declared twice: the
+TypeScript tag tree is generated from the running server.
 
 ## Install
 
@@ -19,16 +23,24 @@ or from a checkout with [uv](https://docs.astral.sh/uv/): `uv sync`, then `uv ru
 
 ```
 ciplink-tagserver run --config tagserver.toml          # real PLCs
-ciplink-tagserver run --config tagserver.toml --mock   # fake values, no PLC needed
+ciplink-tagserver run --config tagserver.toml --mock   # simulated values, no PLC needed
 ciplink-tagserver dump-tags --config tagserver.toml --plc PLC1 --out PLC1_tags.json
-ciplink-tagserver types --url http://127.0.0.1:8765 --token T --plc PLC1 --out src/tags.d.ts
+ciplink-tagserver types --url http://127.0.0.1:8765 --token T --out src/plc.ts
 ```
 
-`types` asks a running server for its tag list (`GET /tags`) and writes a TypeScript union,
-`export type TagName = "Line1.Speed" | ...;`. AOIs appear as their readable members (`Valve1.Open`),
-never their local tags. Pass `--plc` once per PLC; with more than one, names are qualified (`PLC1/Line1.Speed`).
-
 Add `--log-file tagserver.log` to `run` to log to a file (rotated at 10 MB, 5 kept) instead of the console.
+
+## Upgrading from 0.2 (breaking)
+
+- **Writes need a writable rule.** A token `write` pattern alone no longer allows a write: the tag's rule must
+  also say `writable = true` (see Rules). Add rules for your setpoints before upgrading, or every write is
+  rejected with `kind: "not_writable"`.
+- **Write patterns no longer use fnmatch.** `[` and `]` are literal now, so `PLC1/Tank[*].Level` matches
+  `PLC1/Tank[3].Level`, and the old `Arr[[]3]` trick no longer matches anything.
+- `types` writes a typed tag tree by default; `--format names` gives the 0.2 name union.
+- Value entries gain a 4th element (the error), acks gain `kind` and `value`. 0.2 clients ignore both.
+
+All changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Run at Windows startup
 
@@ -54,70 +66,192 @@ relative to it; the task runs in the config's folder. `--name` sets the task nam
 host = "127.0.0.1"      # localhost only by default
 port = 8765
 cycle_ms = 250          # poll period per PLC
-audit_log = "audit.log" # optional, JSON lines of every write attempt
+audit_log = "audit.log" # JSON lines of every write attempt ("" for none)
 tier2_period_s = 3      # each tier-2 tag is read about this often
 grace_s = 10            # a tag leaving tier 1 stays at tier 2 this long
 pages_file = "pages.json" # what each page showed, learned from the clients ("" to keep it in memory)
 planner = true          # read structs whole when that saves reads (false to troubleshoot)
 whole_max_bytes = 1500  # largest struct the planner reads whole
+momentary_timeout_ms = 1000 # a pressed momentary tag with no hold this long is released
 
 [plc.PLC1]
-path = "192.168.1.10"                    # a ciplink/pycomm3 path, e.g. "10.0.0.5/1/3"
+path = "192.168.1.10"                # a ciplink/pycomm3 path, e.g. "10.0.0.5/1/3"
 tag_cache_file = "cache/PLC1.json"   # optional: fast restarts
 mock_tags = "PLC1_tags.json"         # optional: used only with --mock
 
+[[plc.PLC1.rule]]                    # see Rules
+match = "Line1.*.SpeedSP"
+writable = true
+
 [token.viewer]
-secret = "change-me-too"                # no write patterns: read-only
+secret = "change-me-too"             # no write patterns: read-only
 
 [token.hmi1]
 secret = "change-me"
 write = ["PLC1/Line1.*.SpeedSP", "PLC1/Program:Station1.Door*"]
 ```
 
-Relative file paths are relative to the config file. A working example is in `examples/`.
+Relative file paths are relative to the config file. A complete example is
+[`examples/bench/tagserver.toml`](examples/bench/tagserver.toml).
 
 **Tag names** are qualified as `<plc>/<tag>`, e.g. `PLC1/Program:Main.Speed` (a slash cannot appear
 in a Logix tag name). With exactly one PLC configured, unqualified names mean that PLC.
 
-**Write patterns** are `fnmatch` patterns matched against the qualified name, ignoring case. `*` also
-matches dots, and `[...]` is a character class, so to allow `Arr[3]` write `Arr[[]3]` or `Arr?3?`.
+**Patterns** (rules, poll groups, token write patterns) ignore case; `*` matches any run of characters
+(dots and brackets too), `?` one character, everything else is literal: `Tank[*].Level` matches
+`Tank[3].Level`. Rule and group patterns match the tag inside its PLC (`Tank[3].Level`); token write
+patterns match the qualified name (`PLC1/Tank[3].Level`). `match` may be one pattern or a list.
+
+## Rules
+
+```toml
+[[plc.PLC1.rule]]
+match    = "Bench.SpeedSP"
+writable = true        # a setpoint: writes also need a token write pattern
+min      = 0
+max      = 1800
+units    = "rpm"
+description = "Spindle speed setpoint"   # else the controller's description, when ciplink can read it
+
+[[plc.PLC1.rule]]
+match    = "Bench.Speed"
+deadband = 0.5         # changes smaller than this (vs the last value sent) are not sent
+
+[[plc.PLC1.rule]]
+match    = "Bench.StatusWord"
+always   = true        # read at tier 1 even with no subscribers (alarms, logging); literal names only
+bits     = { EStop = 0, DoorOpen = 1, Fault = 2 }   # Bench.StatusWord.EStop is Bench.StatusWord.0
+
+[[plc.PLC1.rule]]
+match    = "Bench.Recipe"
+together = true        # members of this struct are always read in one read: no torn values across scans
+```
+
+- Several rules can match a tag. For each field, the first rule in the file that sets it wins, so put
+  specific rules first.
+- A bit `X.<n>` takes only `writable` from `X`'s rules; `min`, `max`, `units`, `deadband`, `bits` never
+  apply to a bit.
+- Bit names (`X.EStop`) work wherever a tag name does (sub, write, momentary). Values and acks are keyed by
+  the name exactly as the client sent it. An unknown name reads as `missing`.
+- Unknown keys are ignored.
+
+## Poll groups
+
+```toml
+[[plc.PLC1.group]]
+name    = "fast"
+rate_ms = 50
+match   = ["Bench.Axis.Position", "Bench.Axis.Velocity"]
+
+[[plc.PLC1.group]]
+name    = "slow"
+rate_ms = 2000
+match   = ["Tank[*].Temp"]
+```
+
+A group sets the poll rate of a tag **only while it is at tier 1** (on a loaded page, or `always`): polling a
+tag nobody looks at faster is wasted. At tier 2 or 3 the group is ignored. The first matching group wins;
+tags in no group are read every `cycle_ms`. The loop ticks at the smallest rate among `cycle_ms` and the
+groups that have tier-1 tags, and each tick plans what is due together (a group tag due with the cycle's tags
+shares their packets). `/stats`
+shows `groups: {name: {rate_ms, tags, last_period_ms}}` per PLC: `tags` is 0 while no page shows them.
+
+## Writes
+
+Checked in this order, before anything is sent to the PLC; a rejected write's ack carries `kind`:
+
+| check | kind |
+|---|---|
+| the name qualifies (no `{n}` element count, not a whole array: write `X[0]`) and the message is well formed (a `value`) | `bad_request` |
+| a token write pattern matches (as sent, or after bit-name resolution) | `not_allowed` |
+| the tag's rule has `writable = true` | `not_writable` |
+| numbers (also inside lists and dicts) are within the written path's own `min`/`max` | `out_of_range` |
+| type and size, checked by ciplink per tag, nothing sent | `bad_value` |
+
+The PLC thread runs queued writes between the packets of a cycle (a write waits about one packet, not a
+whole cycle), then reads the written tag back (a bit: its word) and publishes it. The ack is
+`{"op":"ack","id":N,"ok":true,"error":null,"kind":null,"value":<read-back>}`. A write while the PLC is not
+connected fails at once with `refused`; a connection lost during the write gives `comm`. Writes are never
+retried. Every attempt, allowed or not, is one JSON line in `audit_log` (`time`, `token`, `tag`, `old`,
+`value`, `ok`, `error`, `kind`, and `momentary` for buttons), written by a background thread.
+
+## Momentary buttons
+
+`{"op":"momentary","id":N,"tag":"Bench.StartPB","action":"press"|"hold"|"release"}`, for BOOL tags and bits,
+with the same checks as a write. `press` writes true and `release` false, each acked like a write. While the
+button is held the client sends `hold` every 300 ms (no ack). With no `press` or `hold` for
+`momentary_timeout_ms`, the server writes false itself (`/stats` `momentary_timeouts`), and a closed
+connection releases everything it held, also when the server shuts down. A release that fails because the
+PLC is not reachable is written again when the PLC connects, and one refused while it stays connected (a
+tag table reload, a busy controller) is written again every half second until it goes through. So a lost tab, a crashed browser or a cut cable
+never leaves a jog button pressed.
+
+## Tag info
+
+The first time a connection subscribes a name, the server sends its info before the values:
+
+```json
+{"op":"info","d":{"Bench.SpeedSP":{"type":"REAL","writable":true,"rate_ms":250,"group":null,
+ "min":0,"max":1800,"units":"rpm","description":"Spindle speed setpoint"}}}
+```
+
+`type` comes from the controller (null until the PLC is connected), `writable` is true only when the rule
+says so and this connection's token may write it, `dims` is set for a whole array, `bits` on a word with bit
+names. Bits and bit names are `BOOL`. Info is sent again after a tag table reload and when a PLC connects.
+
+## Codegen: the typed tag tree
+
+```
+ciplink-tagserver types --url http://127.0.0.1:8765 --token T --out src/plc.ts
+```
+
+reads `GET /tags` from a running server (real or `--mock`) and writes a TypeScript module: one interface per
+UDT, a `PLC1Tags` interface of the controller and `Program:` scopes, and `export const PLC1 = tagTree<PLC1Tags>(...)`.
+
+```ts
+import { PLC1 } from "./plc";
+<TagValue name={PLC1.Tank[2].Level} />          // "Tank[2].Level"
+<NumericInput name={PLC1.Bench.SpeedSP} />       // compiles only if the rule makes it writable
+<TagLamp name={PLC1.Bench.StatusWord.EStop} />   // bit names from the rules; .bit(3) for any bit
+```
+
+Leaves are `TagRef<number|boolean|string, W>`, with `W` true where a rule makes the path writable, so
+`useWriteTag`, `NumericInput` and `MomentaryButton` reject read-only tags at compile time. Arrays are
+`TagArray<T, N>` with a literal `length`, not refs: a bare array name reads and writes only its first
+element, so use `Trend[0]`. The header gives the tag table version: run it again after a
+download and let `tsc` show what changed. With one `--plc` (or none) names are unqualified; with several,
+one tree per PLC with qualified names. `--format names` writes the 0.2 union `type TagName = "..." | ...`.
 
 ## Protocol (v1)
 
-JSON messages over `ws://host:port/ws`.
+JSON messages over `ws://host:port/ws`. Every 0.3 addition is optional, so 0.2 clients keep working.
 
-Client to server:
+| op | dir | fields |
+|---|---|---|
+| `hello` | c→s | `v: 1`, `token`; must be first |
+| `welcome` | s→c | `v`, `plcs: {PLC: state}`, `write` (the token has write patterns), `features: ["info","momentary","readback","errors"]` |
+| `sub` | c→s | `id`, `tags: [...]`, `tier` (1-3, default 1), `page`; with `page` and no `tags`: that page's learned tags. Reusing an id replaces it |
+| `unsub` | c→s | `id` |
+| `info` | s→c | `d: {name: info}` (see Tag info) |
+| `values` | s→c | `d: {name: [value, quality, t, error]}`: changes only; after a `sub`, the cached values |
+| `write` | c→s | `id`, `tag`, `value` |
+| `momentary` | c→s | `id`, `tag`, `action: press / hold / release` |
+| `ack` | s→c | `id`, `ok`, `error`; for write and momentary also `kind` and `value` (the read-back) |
+| `status` | s→c | `plcs: {PLC: "connecting" / "connected" / "disconnected"}` |
+| `meta` | s→c | `plc`: its tag table was reloaded (online edit, download): fetch `/tags` again |
+| `error` | s→c | `id`, `error`: a bad request (`id` null when unknown) |
 
-| message | meaning |
-|---|---|
-| `{"op":"hello","v":1,"token":"<secret>"}` | must be the first message |
-| `{"op":"sub","id":N,"tags":["..."],"tier":1,"page":"/line1"}` | subscribe; reusing an id replaces that subscription. `tier` (default 1) and `page` are optional |
-| `{"op":"sub","id":N,"page":"/line1","tier":2}` | subscribe the tags learned for that page (see Tiers and pages) |
-| `{"op":"unsub","id":N}` | drop subscription N |
-| `{"op":"write","id":N,"tag":"...","value":...}` | write one tag |
+- A bad token, a first message that is not `hello`, or another protocol version: closed with code **4401**.
+- `quality`: `good`; `missing` (no such tag, or not readable from outside: value null); `bad` (the read
+  failed: the **last value is kept**); `stale` (PLC disconnected: last value kept). `error` is null when good,
+  else `{"kind": "...", "message": "..."}` with ciplink's kinds (`not_found`, `access`, `comm`, ...).
+- Values: structs are objects, arrays lists, bytes hex strings, NaN and infinities the strings `"NaN"`,
+  `"Infinity"`, `"-Infinity"`. `t` is ms since the epoch. A numeric change below the rule's `deadband` is not sent.
+- Writes and reconnects: see Writes. Reconnects back off 1, 2, 5, then every 10 s.
 
-Server to client:
-
-| message | when |
-|---|---|
-| `{"op":"welcome","v":1,"plcs":{"PLC1":"connected"},"write":true}` | after a good hello; `write` says whether the token has any write patterns |
-| `{"op":"values","d":{"<tag>":[value, quality, t]}}` | changed values only; right after a `sub`, the values already cached |
-| `{"op":"ack","id":N,"ok":true,"error":null}` | for `sub`, `unsub` and `write` |
-| `{"op":"status","plcs":{"PLC1":"disconnected"}}` | a PLC changed state |
-| `{"op":"meta","plc":"PLC1"}` | the PLC's tag table was reloaded (online edit, download): fetch `/tags` again |
-| `{"op":"error","id":N,"error":"..."}` | bad request (`id` is null when unknown) |
-
-- A bad token, a first message that is not `hello`, or another protocol version: the socket is closed with code **4401**.
-- Tags in `values` are keyed by the name as the client subscribed it.
-- `quality` is `good`, `bad` (the read failed), `missing` (no such tag, or an AOI local tag that cannot
-  be read from outside) or `stale` (PLC disconnected: the last value is kept). `value` is null for bad and missing.
-- `t` is the time of the change in ms since the epoch.
-- Values: structs and AOIs are objects, arrays are lists, bytes are hex strings, NaN and infinities are
-  the strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
-- PLC states: `connecting`, `connected`, `disconnected`. Reconnects back off 1, 2, 5, then every 10 s.
-- `tier` is 1, 2 or 3, see below.
-- Writes go to the PLC's thread, run after that cycle's read, and the ack carries the driver's result.
-  They are never retried; a write while the PLC is not connected fails at once.
+`tests/conformance/` checks a server against this table over a real WebSocket (an in-process `--mock` Test
+Bench by default): `pytest tests/conformance --url http://host:8765 --token T --viewer-token V` runs it
+against any server serving the Test Bench tags and rules.
 
 ## Tiers and pages
 
@@ -126,13 +260,13 @@ every cycle:
 
 | tier | read |
 |---|---|
-| 1 | every cycle: what is on screen |
-| 2 | round robin, each tag about every `tier2_period_s`: what is likely next (a cycle reads all of tier 1 and the next slice of tier 2) |
+| 1 | every cycle (or its poll group's rate): what is on screen |
+| 2 | round robin, each tag about every `tier2_period_s`: what is likely next |
 | 3 | never: accepted and kept, not polled |
 
-A tag's tier is the lowest among its subscriptions. A tag new at tier 2 is read once in the next cycle,
-then in its slice. When its last tier-1 subscription ends it is read at tier 2 for `grace_s` more, so
-going back to a page finds fresh values, then it drops out (or to tier 3).
+A tag's tier is the lowest among its subscriptions. A tag new at tier 2 is read at the next tick, then in its
+slice. When its last tier-1 subscription ends it is read at tier 2 for `grace_s` more, so going back to a page
+finds fresh values, then it drops out (or to tier 3).
 
 **Pages.** A tier-1 `sub` carrying `"page": "/line1"` (the client's current route) teaches the server that
 page's tags; it keeps the union per page in `pages_file` (saved a moment after a change, by an atomic
@@ -144,73 +278,85 @@ Known limits: a page's learned list only grows (a tag removed from a page, or de
 listed until you edit or delete `pages_file`), and a tier-1 subscription re-sent after the route changed
 (say, a component that stays mounted across pages) teaches the new page its tags too.
 
-**Read planner.** Each cycle, members of the same struct can be read through one read of that struct and
-sliced out of it: for `Line1.Motor.Speed` and `Line1.Motor.Current`, `Line1.Motor` is read once. The
-struct can be a tag, an array element like `Arr[3]`, or a nested member, also in program scope, of at
-most `whole_max_bytes`. An extra packet costs far more than a few reads, so the planner estimates each
-read's request and reply bytes and takes groups best first (fewest extra reply bytes per read saved), each
-only if it adds at most 450 reply bytes per read saved (about the packet time of one read) and the
-cycle's estimated packet count (packed as ciplink packs them, in the driver's `connection_size`, else
-4000 bytes) stays what plain reads would take. A group can grow into its parent struct under the same
-rules. A tag that is itself a whole struct is read anyway, so the tags under it come free. Never grouped:
-bit access (`X.Count.5`), several elements (`X{3}`), whole arrays, strings, BOOL arrays, and AOIs (or
-structs holding one) that cannot be read whole. If a struct read fails, its members are read one by one in
-the same cycle, and that struct is read whole again only after 60 s or a tag table reload
-(`group_fallbacks`). Clients get the same values either way; `planner = false` turns it off.
+**Read planner.** Members of one struct can be read through one read of that struct and sliced out:
+for `Line1.Motor.Speed` and `Line1.Motor.Current`, `Line1.Motor` is read once. Two or more elements of a
+1-D atomic array (`Trend[3]`, `Trend[4]`, `Trend[7]`) can become one ranged read `Trend[3]{5}`. An extra
+packet costs far more than a few reads, so the planner estimates each read's request and reply bytes and
+takes groups best first, each only if it adds at most 450 reply bytes per read saved and the cycle's
+estimated packet count stays what plain reads would take. A `together` rule forces its struct whole
+whatever the cost (if it fits a packet). Never grouped: bit access, element counts, whole arrays, strings,
+BOOL arrays, and AOIs that cannot be read whole. If a struct read fails, its members are read one by one
+in the same cycle, and the struct is tried whole again after 60 s or a reload (`group_fallbacks`).
+`planner = false` turns it off.
 
 ## HTTP
 
 - `GET /health`: per PLC `state`, `last_cycle_ms`, `last_ok_ts`, `reconnects`, `reloads`.
-- `GET /stats`: `sessions`, and per PLC `reads_per_cycle` (read services sent in the last cycle, after
-  planning), `tags_per_cycle` (tags it served), `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`,
-  `tier1`, `tier2`, `tier3` (tags per tier) and `group_fallbacks`.
-- `GET /tags?plc=NAME` with `Authorization: Bearer <secret>`: the PLC's tags with data type and, for
-  AOIs, `aoi_readable` (the members that can be read). `plc` may be left out with one PLC.
+- `GET /stats`: `sessions`, `writes`, `write_rejects`, `momentary_timeouts`, and per PLC `reads_per_cycle`,
+  `tags_per_cycle`, `last_cycle_ms`, `cycle_ms`, `overruns`, `subscriptions`, `tier1`, `tier2`, `tier3`,
+  `group_fallbacks` and `groups`.
+- `GET /tags?plc=NAME` with `Authorization: Bearer <secret>`: `{plc, state, version, tags: [{name, type,
+  dims?, aoi_readable?}], types: {UDT: {members: {m: {type, dims?}}}}, rules, groups}`. Strings show as type
+  `STRING`. `plc` may be left out with one PLC. CORS allows GET from any origin (the TagBrowser fetches it).
 
 ## React
 
-[`@ciplink/react`](client/) (in `client/`) is the React side: one provider that owns the WebSocket, and
-hooks and components that subscribe while mounted.
+[`@ciplink/react`](client/) is the React side: one provider that owns the WebSocket, and hooks and
+components that subscribe while mounted. See [client/README.md](client/README.md) for the full API.
 
 ```tsx
-import { TagServerProvider, TagValue, TagLamp, useWriteTag, useTagServer } from "@ciplink/react";
+import { TagServerProvider, TagValue, TagLamp, NumericInput, MomentaryButton, derive } from "@ciplink/react";
+import { PLC1 } from "./plc"; // generated
 
-<TagServerProvider url="ws://127.0.0.1:8765/ws" token="change-me">
-  <TagValue name="Line1.Station1.Speed" decimals={1} unit="m/min" />
-  <TagLamp name="Line1.Running" />
+const avgLevel = derive((get) => [0, 1, 2, 3].reduce((s, i) => s + (get(PLC1.Tank[i].Level) ?? 0), 0) / 4);
+
+<TagServerProvider url="ws://127.0.0.1:8765/ws" token="change-me" page={route}>
+  <TagValue name={PLC1.Bench.Speed} decimals={1} />          {/* units from the rule */}
+  <TagLamp name={PLC1.Bench.StatusWord.EStop} />
+  <NumericInput name={PLC1.Bench.SpeedSP} />                  {/* min/max from the rule, inline confirm */}
+  <MomentaryButton name={PLC1.Bench.StartPB}>Start</MomentaryButton>
+  <TagValue name={avgLevel} decimals={1} unit="%" />
 </TagServerProvider>
 ```
 
-- `useTag(name)` gives `{value, quality, t}` and re-renders only when that tag changes; subscriptions are
-  counted across components and batched.
-- `useTags(names)`, `useWriteTag(name)` (resolves with the write's ack), `useTagServer()` (connection
-  state, PLC states, `canWrite`).
-- `<TagValue>` and `<TagLamp>` are fixed width with a quality marker, so nothing moves as values change.
-- `<TagServerProvider page={path}>`: tier-1 subscriptions carry the current route, so the server learns
-  each page's tags, and `<TagLink to as?>` subscribes the target page's learned tags at tier 2 while it is
-  on screen. `registerPage(path, tags)` seeds a page by hand.
-- Reconnects after 1, 2, 5, then every 10 s, re-subscribes, and shows values as `stale` meanwhile.
+- `useTag`, `useTags`, `useTagInfo`, `useWriteTag` (resolves with the ack), `useMomentary`, `useTagServer`.
+- Every component is fixed size: nothing moves when values, quality, info or pending state change.
+- Bits (`X.3`, `.bit(3)`) are computed from the word in the client; `derive` computes values from other tags
+  with the worst input quality. `<TagLink>` prefetches a page's learned tags at tier 2; `<TagBrowser>` is a tree
+  of `/tags` where only expanded rows subscribe.
 
-A runnable app is in [`examples/react-app/`](examples/react-app/): start the server with
-`uv run ciplink-tagserver run --config examples/tagserver.toml --mock`, then `npm install && npm run dev`
-in the example (it builds `client/` first). It has two pages linked by `<TagLink>`s, to show tier 2.
+## The Test Bench example
+
+[`examples/bench/`](examples/bench/) is a small mock-driven bench that exercises every signal: momentary
+Start/Stop with the watchdog, a writable setpoint with limits, a deadbanded speed that follows it, a 50 ms
+axis group only on the Motion page, an `always` status word with bit names, a `together` recipe, an array of
+UDTs with a slow group and a derived average, a ranged-read trend, a program-scope tag, a missing tag, the
+tag browser and a status bar. Its `src/plc.ts` is generated against the mock server. `npm run e2e` drives
+it in Chrome and checks values, groups, writes, buttons, the watchdog and that no control ever moves.
+
+![Test Bench](examples/bench/screenshot.png)
 
 ## Mock mode
 
-`--mock` replaces every PLC driver with a fake serving the tags in that PLC's `mock_tags` file:
+`--mock` replaces every PLC driver with a simulation of the tags in that PLC's `mock_tags` file, either the
+0.2 flat `{"Line1.Speed": "REAL"}` or structured:
 
 ```json
-{"Line1.Station1.Speed": "REAL", "Line1.Running": "BOOL", "PartCount": "DINT"}
+{"types": {"TankData": {"Level": "REAL", "Temp": "REAL", "Valve": "BOOL"}},
+ "tags":  {"Tank": "TankData[4]", "Trend": "REAL[16]", "Bench": "BenchData", "Program:Bench.Mode": "DINT"}}
 ```
 
-Numbers random-walk, BOOLs toggle now and then, writes are stored, unknown names are `missing`. Other
-types (UDTs, AOIs) read as `bad`; list their atomic members by full name to simulate them.
-`dump-tags` writes this file from a real PLC (it only uploads the tag list), so a mock can mirror it.
+Types are `NAME` or `NAME[n]`. Reads support members, elements, ranges, bits and whole structs, so the planner
+runs as on a PLC. Values are shaped by the name: `temp` 20-90, `level` 0-100, `position` ramps, `count`
+counts, words carry a few toggling bits, `speed` follows its `SpeedSP` while a sibling `Running` is true,
+`StartPB`/`StopPB` set `Running`, and written values hold. Writes are type-checked like ciplink's. Unknown
+names are `missing`. `dump-tags` writes a flat file from a real PLC's tag list.
 
 ## Safety
 
-- Writes are off unless a token has `write` patterns, and only names matching them can be written.
+- Writes are off unless a token has `write` patterns **and** a rule makes the tag `writable`.
 - Every write attempt, allowed or not, is appended to the audit log.
+- Momentary buttons are released by the server when the client stops holding them.
 - The server binds to `127.0.0.1` by default. Put it behind a TLS proxy before opening it to a network:
   tokens travel in clear text over plain `ws://` and `http://`.
 - Change the example secrets.

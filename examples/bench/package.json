@@ -1,7 +1,7 @@
 {
-  "name": "ciplink-react-example",
+  "name": "ciplink-bench",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "build:client": "cd ../../client && npm install --no-audit --no-fund && npm run build",
@@ -9,7 +9,10 @@
     "dev": "vite",
     "prebuild": "npm run build:client",
     "build": "tsc -p . && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "codegen": "cd ../.. && ciplink-tagserver types --url http://127.0.0.1:8765 --token bench-hmi --out examples/bench/src/plc.ts",
+    "pree2e": "npm run build:client",
+    "e2e": "node e2e/bench.e2e.mjs"
   },
   "dependencies": {
     "@ciplink/react": "file:../../client",
@@ -20,6 +23,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
+    "playwright-core": "1.64.1",
     "typescript": "^5.9.3",
     "vite": "^8.3.4"
   }

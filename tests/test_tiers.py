@@ -11,17 +11,39 @@ from ciplink_tagserver.worker import PlcWorker
 from conftest import BIG, FakeDriver, FakePLC, hello, plant, tag_def, until, wait_for
 
 
+class FakeClock:
+    """Swaps a worker's clock and wait: wait(s) advances the time by s and returns True after n waits.
+    at: {wait number: fn(worker)} runs after that wait (between ticks)."""
+
+    def __init__(self, worker, n=10**9, at=None):
+        self.now, self.waits, self.n, self.at, self.worker = 1000.0, [], n, at or {}, worker
+        worker.clock = lambda: self.now
+        worker.wait = self.wait
+        worker.fake_clock = self
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.now += seconds
+        if len(self.waits) in self.at:
+            self.at[len(self.waits)](self.worker)
+        return len(self.waits) >= self.n
+
+
+def poll(worker, driver, n, at=None):
+    """Runs n ticks of a connected worker in this thread on a FakeClock; returns the clock."""
+    clock = getattr(worker, "fake_clock", None) or FakeClock(worker)
+    clock.waits, clock.n, clock.at = [], n, at or {}
+    worker._check_version(driver, connecting=True)
+    worker._plc, worker.state = driver, "connected"
+    worker._poll(driver)
+    return clock
+
+
 def run_cycles(fake, n, setup, **kw):
     """Runs a worker for n poll cycles with a fake clock; returns it (stopped)."""
     worker = PlcWorker(PlcConfig("P", "x"), lambda cfg: FakeDriver(fake), kw.pop("cycle_ms", 100), **kw)
+    FakeClock(worker, n)
     setup(worker)
-    calls = []
-
-    def fake_wait(seconds):
-        calls.append(seconds)
-        return len(calls) >= n
-
-    worker.wait = fake_wait
     worker.start()
     worker._thread.join(5)
     return worker
@@ -54,13 +76,14 @@ def test_a_new_tier2_tag_is_read_in_the_next_cycle_then_in_its_slice():
     worker = PlcWorker(PlcConfig("P", "x"), None, 100, tier2_period_s=10)  # 100 slices
     worker.add_tags([f"B{i}" for i in range(5)], 2)
     now = time.monotonic()
-    assert len(worker._cycle_tags(now)) == 5
-    assert len(worker._cycle_tags(now)) <= 1
+    tags = lambda: worker._cycle_tags(now)[0]
+    assert len(tags()) == 5
+    assert len(tags()) <= 1
     worker.add_tags(["New"], 2)
-    assert "New" in worker._cycle_tags(now)
+    assert "New" in tags()
     worker.set_tier("Up", 1)
     worker.set_tier("Up", 2)  # was read every cycle: no extra read
-    assert "New" not in worker._cycle_tags(now) and "Up" not in worker._cycle_tags(now)
+    assert "New" not in tags() and "Up" not in tags()
 
 
 def test_failed_group_is_read_whole_again_after_group_retry(monkeypatch):
@@ -83,25 +106,30 @@ def test_failed_group_is_read_whole_again_after_group_retry(monkeypatch):
 
 def test_grace_demotion():
     worker = PlcWorker(PlcConfig("P", "x"), None, 100, grace_s=10)
+    clock = FakeClock(worker)
+
+    def after(seconds):  # one cycle that many seconds later
+        clock.now += seconds
+        worker._cycle_tags(clock.now)
+
     worker.set_tier("T", 1)
     worker.set_tier("T", None)  # last tier-1 subscription gone
     assert worker.tiers == {"T": 2}
-    now = time.monotonic()
-    worker._cycle_tags(now + 5)  # still polled, at tier 2, during the grace
+    after(5)  # still polled, at tier 2, during the grace
     assert worker.tiers == {"T": 2}
-    worker._cycle_tags(now + 11)
+    after(6)
     assert worker.tiers == {}
 
     worker.set_tier("T", 1)
     worker.set_tier("T", 3)  # only a tier-3 subscription left: tier 2 for the grace, then 3
-    worker._cycle_tags(now + 5)
+    after(5)
     assert worker.tiers == {"T": 2}
-    worker._cycle_tags(now + 11)
+    after(6)
     assert worker.tiers == {"T": 3}
 
     worker.set_tier("T", 1)
     worker.set_tier("T", 2)  # still subscribed at tier 2: no grace, stays
-    worker._cycle_tags(now + 11)
+    after(11)
     assert worker.tiers == {"T": 2}
     worker.set_tier("T", None)  # leaving tier 2 needs no grace
     assert worker.tiers == {}
@@ -109,7 +137,7 @@ def test_grace_demotion():
     worker.set_tier("T", 1)
     worker.set_tier("T", None)
     worker.set_tier("T", 1)  # back within the grace
-    worker._cycle_tags(now + 11)
+    after(11)
     assert worker.tiers == {"T": 1}
 
 

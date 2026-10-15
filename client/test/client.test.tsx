@@ -11,6 +11,7 @@ import {
   useTagServer,
   useTags,
   useWriteTag,
+  type WriteResult,
 } from "../src/index.js";
 
 class FakeWebSocket {
@@ -301,7 +302,7 @@ describe("connection", () => {
 });
 
 describe("writes", () => {
-  let write: (value: unknown) => Promise<{ ok: boolean; error: string | null }>;
+  let write: (value: unknown) => Promise<WriteResult>;
   function Writer() {
     write = useWriteTag("Line1.SpeedSP");
     return null;
@@ -309,22 +310,22 @@ describe("writes", () => {
 
   it("resolves with the ack", async () => {
     wrap(<Writer />);
-    expect(await write(1)).toEqual({ ok: false, error: "not connected" });
+    expect(await write(1)).toEqual({ ok: false, error: "not connected", kind: "comm", value: null });
     await connect();
     const ws = last();
     const pending = write(42.5);
     const sent = ws.ops("write")[0];
     expect(sent).toMatchObject({ op: "write", tag: "Line1.SpeedSP", value: 42.5 });
     ws.receive({ op: "ack", id: sent.id, ok: true, error: null });
-    expect(await pending).toEqual({ ok: true, error: null });
+    expect(await pending).toEqual({ ok: true, error: null, kind: null, value: null });
 
     const denied = write(1);
     ws.receive({ op: "ack", id: ws.ops("write")[1].id, ok: false, error: "not allowed" });
-    expect(await denied).toEqual({ ok: false, error: "not allowed" });
+    expect(await denied).toMatchObject({ ok: false, error: "not allowed" }); // a 0.2 ack has no kind
 
     const lost = write(2);
     ws.drop();
-    expect(await lost).toEqual({ ok: false, error: "disconnected" });
+    expect(await lost).toEqual({ ok: false, error: "disconnected", kind: "comm", value: null });
   });
 });
 

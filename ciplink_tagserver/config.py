@@ -11,13 +11,15 @@ class PlcConfig:
     path: str
     tag_cache_file: str | None = None
     mock_tags: str | None = None
+    rules: list[dict] = field(default_factory=list)  # [[plc.X.rule]] tables in file order, see rules.py
+    groups: list[dict] = field(default_factory=list)  # [[plc.X.group]] tables: name, rate_ms, match
 
 
 @dataclass
 class TokenConfig:
     name: str
     secret: str
-    write: list[str] = field(default_factory=list)  # fnmatch patterns on qualified names
+    write: list[str] = field(default_factory=list)  # rules.match patterns on qualified names
 
 
 @dataclass
@@ -31,6 +33,7 @@ class Config:
     pages_file: str | None = "pages.json"  # learned page -> tags, None to keep them in memory only
     planner: bool = True  # read structs whole when that saves reads
     whole_max_bytes: int = 1500  # largest struct the planner reads whole
+    momentary_timeout_ms: int = 1000  # a pressed momentary tag with no hold this long is released
     plcs: dict[str, PlcConfig] = field(default_factory=dict)
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
 
@@ -73,6 +76,7 @@ def parse_config(data: dict, base_dir=".") -> Config:
         pages_file=resolve(server.get("pages_file", "pages.json")),
         planner=server.get("planner", True),
         whole_max_bytes=server.get("whole_max_bytes", 1500),
+        momentary_timeout_ms=server.get("momentary_timeout_ms", 1000),
     )
     for name, plc in data.get("plc", {}).items():
         config.plcs[name] = PlcConfig(
@@ -80,7 +84,13 @@ def parse_config(data: dict, base_dir=".") -> Config:
             path=plc["path"],
             tag_cache_file=resolve(plc.get("tag_cache_file")),
             mock_tags=resolve(plc.get("mock_tags")),
+            rules=list(plc.get("rule", [])),
+            groups=list(plc.get("group", [])),
         )
+        for group in config.plcs[name].groups:
+            rate = group.get("rate_ms")
+            if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0 or "name" not in group:
+                raise ValueError(f"plc.{name}.group needs a name and an integer rate_ms > 0: {group}")
     for name, token in data.get("token", {}).items():
         config.tokens[name] = TokenConfig(name=name, secret=token["secret"], write=list(token.get("write", [])))
     return config

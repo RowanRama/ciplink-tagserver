@@ -4,7 +4,7 @@ import re
 import time
 
 import pytest
-from ciplink import CommError, Tag
+from ciplink import CommError, ErrorKind, Tag, TagError
 from fastapi.testclient import TestClient
 
 from ciplink_tagserver.config import load_config
@@ -33,11 +33,14 @@ def udt(name, size, members, aoi=None, string=None):
     return data_type
 
 
-def tag_def(data_type, dim=0):
-    """A ciplink-like entry of plc.tags."""
+def tag_def(data_type, dim=0, dims=()):
+    """A ciplink-like entry of plc.tags; dims: the array dimensions."""
+    dimensions = (list(dims) + [0, 0, 0])[:3]
     if isinstance(data_type, dict):
-        return {"tag_type": "struct", "data_type": data_type, "data_type_name": data_type["name"], "dim": dim}
-    return {"tag_type": "atomic", "data_type": data_type, "data_type_name": data_type, "dim": dim}
+        return {"tag_type": "struct", "data_type": data_type, "data_type_name": data_type["name"], "dim": dim,
+                "dimensions": dimensions}
+    return {"tag_type": "atomic", "data_type": data_type, "data_type_name": data_type, "dim": dim,
+            "dimensions": dimensions}
 
 
 def _key(d, name):
@@ -50,12 +53,12 @@ class FakePLC:
 
     def __init__(self):
         # tag -> value; tags not here read as "Tag doesn't exist". A struct is a dict (an array a list) and
-        # member paths (Line1.Motor.Speed, Arr[1].X, Count.5) are read out of it.
+        # member paths (Line1.Motor.Speed, Arr[1].X, Count.5) and ranges (Trend[2]{3}) are read out of it.
         self.values = {}
         self.errors = {}  # tag -> error string
         self.fail = False  # open() and read() raise CommError
         self.version = 1
-        self.reads = []  # tuples of tag names per read call
+        self.reads = []  # tuples of tag names per read call (one per chunk of a planned cycle)
         self.writes = []
         self.write_error = None
         self.tags = {}
@@ -124,9 +127,17 @@ class FakeDriver:
                 results.append(Tag(tag, None, None, self.plc.errors[tag]))
                 continue
             try:
-                results.append(Tag(tag, self._value(tag), "DINT", None))
+                ranged = re.fullmatch(r"(.+?)(?:\[(\d+)\])?\{(\d+)\}", tag)
+                if ranged:
+                    start, count = int(ranged.group(2) or 0), int(ranged.group(3))
+                    value = self._value(ranged.group(1))[start:start + count]
+                    if len(value) != count:
+                        raise IndexError(tag)
+                else:
+                    value = self._value(tag)
+                results.append(Tag(tag, value, "DINT", None))
             except (KeyError, IndexError, TypeError, StopIteration):
-                results.append(Tag(tag, None, None, f"Tag doesn't exist - {tag}"))
+                results.append(Tag(tag, None, None, TagError(f"Tag doesn't exist - {tag}", ErrorKind.NOT_FOUND)))
         return results[0] if len(results) == 1 else results
 
     def write(self, tag, value):
@@ -230,7 +241,7 @@ def station(n):
 def plant(fake):
     """Generic structs, AOIs and atomics on a FakePLC."""
     fake.tags = {
-        "Line1": tag_def(STATION), "Line2": tag_def(STATION), "Arr": tag_def(STATION, dim=1),
+        "Line1": tag_def(STATION), "Line2": tag_def(STATION), "Arr": tag_def(STATION, dim=1, dims=[5]),
         "Program:Station1.Motor": tag_def(MOTOR), "Big1": tag_def(BIG), "Valve1": tag_def(VALVE),
         "Pump1": tag_def(PUMP), "Cell1": tag_def(CELL), "Name1": tag_def(STR),
         "Speed": tag_def("REAL"), "Count": tag_def("DINT"), "Flags": tag_def("DINT"),

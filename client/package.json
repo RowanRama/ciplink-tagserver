@@ -1,6 +1,6 @@
 {
   "name": "@ciplink/react",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "React hooks and components for ciplink-tagserver: live PLC tag values over one WebSocket",
   "license": "MIT",
   "author": "Rowan Ramamurthy",

@@ -2,9 +2,10 @@
 
 A poll costs about 12 ms per packet plus 1.35 ms per read service, so fewer reads matter, but an extra
 packet costs far more than a few reads. For the tags of one cycle, a struct (a tag, an array element or a
-nested member, at most ``whole_max_bytes``) replaces the reads of the tags under it when that pays: groups are
-taken best first by extra reply bytes per read saved, each only if it costs at most ``BYTES_PER_READ`` extra
-reply bytes per read saved and the cycle's estimated packet count does not grow over plain reads.
+nested member, at most ``whole_max_bytes``) or a run of elements of one atomic array (``A[3]{5}``) replaces
+the reads of the tags under it when that pays: groups are taken best first by extra reply bytes per read
+saved, each only if it costs at most ``BYTES_PER_READ`` extra reply bytes per read saved and the cycle's
+estimated packet count does not grow over plain reads. A ``together`` struct is always read whole.
 """
 
 import math
@@ -25,6 +26,7 @@ PACKET_BYTES = 4000  # request and reply budget of a packet when the driver has 
 ATOMIC_SIZES = {"BOOL": 1, "SINT": 1, "USINT": 1, "BYTE": 1, "INT": 2, "UINT": 2, "WORD": 2, "DINT": 4,
                 "UDINT": 4, "DWORD": 4, "REAL": 4, "LINT": 8, "ULINT": 8, "LWORD": 8, "LREAL": 8}
 
+_RANGE = re.compile(r"(.+)\{(\d+)\}")
 _TOKEN = re.compile(r"(?P<name>\.?[A-Za-z_][A-Za-z0-9_]*)|\[(?P<index>\d+(?:,\d+)*)\]")
 
 
@@ -90,12 +92,15 @@ def _struct_size(info, last_key, memo):
     return (data_type.get("template") or {}).get("structure_size")
 
 
-def request_size(name) -> int:
-    """Estimated size of a Read Tag service for ``name``, the base tag addressed by its instance ID."""
+def request_size(name, get_info=None) -> int:
+    """Estimated size of a Read Tag service for ``name``, the base tag addressed by its instance ID (sized
+    from ``get_info(base)``; a 16-bit ID when unknown, as on most real controllers)."""
     tokens = tokenize(name)
     if tokens is None:
         return 10 + len(name) + len(name) % 2
-    size = 4 + 6  # service, path size, element count; class and instance segments
+    base = (get_info(tokens[0][0]) or {}) if get_info else {}
+    instance = base.get("instance_id")
+    size = 4 + 4 + (2 if isinstance(instance, int) and instance < 256 else 4 if (instance or 0) < 65536 else 6)
     if tokens[0][0].lower().startswith("program:"):
         program = tokens[0][0].split(".")[0]
         size += 2 + len(program) + len(program) % 2
@@ -118,26 +123,40 @@ def reply_size(info) -> int:
     return ATOMIC_SIZES.get(info.get("data_type_name") or info.get("data_type"), 4) + 8
 
 
-def packets(sizes, budget=PACKET_BYTES) -> int:
-    """Packets for reads of these (request, reply) sizes, packed in order as ciplink does."""
+
+
+def _pack(sizes, budget):
+    """([[index]] of the packets reads of these (request, reply) sizes go in, packet count), packed in order
+    as ciplink does: the other reads first, then each fragmented read alone, taking several packets. With
+    version checks, a read sent alone also gets a standalone check before and after it (the worker sends
+    each in its own plc.read, so both are counted)."""
     empty_request, empty_reply = 10 + VERSION_REQUEST, 8 + VERSION_REPLY
-    count, request, reply = 0, empty_request, empty_reply
-    for req, rep_ in sizes:
-        if empty_request + req > budget or empty_reply + rep_ > budget:  # fragmented: packets of its own
-            count += math.ceil(rep_ / (budget - empty_reply))
+    groups, fragmented_groups, count, current, request, reply = [], [], 0, [], empty_request, empty_reply
+    for i, (req, rep_) in enumerate(sizes):
+        if empty_request + req > budget or empty_reply + rep_ > budget:
+            fragmented_groups.append([i])
+            count += max(1, math.ceil(rep_ / (budget - empty_reply))) + (2 if VERSION_REQUEST else 0)
             continue
-        if request + req > budget or reply + rep_ > budget:
+        if current and (request + req > budget or reply + rep_ > budget):
+            groups.append(current)
             count += 1
-            request, reply = empty_request, empty_reply
+            current, request, reply = [], empty_request, empty_reply
+        current.append(i)
         request += req
         reply += rep_
-    return count + (1 if request > empty_request else 0)
+    if current:
+        groups.append(current)
+        count += 1
+    return groups + fragmented_groups, count
 
 
-def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BYTES):
-    """The reads for ``tags``: [(read name, [(tag, path)])], path being the keys that slice the tag's value
-    out of the read value, or None for the value as read. ``get_info(name)`` is the driver's tag definition,
-    None if unknown. Names in ``no_group`` (lowercase) are not read whole. ``budget``: bytes per packet."""
+def packets(sizes, budget=PACKET_BYTES) -> int:
+    """Packets for reads of these (request, reply) sizes, packed in order as ciplink does."""
+    return _pack(sizes, budget)[1]
+
+
+def _info_getter(get_info):
+    """get_info memoized per call, None for what it doesn't know or raises on."""
     infos = {}
 
     def info(name):
@@ -149,12 +168,44 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BY
                 infos[key] = None
         return infos[key]
 
+    return info
+
+
+def _element_size(info):
+    """Size of one element of an atomic 1-D array whose elements can be read as a run, else None."""
+    if not info or info.get("tag_type") != "atomic" or not (info.get("dim") == 1 or (info.get("array") or 0) > 0):
+        return None
+    name = info.get("data_type_name") or info.get("data_type")
+    return None if name in ("BOOL", "DWORD") else ATOMIC_SIZES.get(name)  # BOOL/DWORD elements are bits
+
+
+def read_size(name, get_info):
+    """Estimated (request, reply) sizes of a read of ``name`` as ``plan`` writes it, ``A[3]{5}`` included."""
+    info = _info_getter(get_info)
+    m = _RANGE.fullmatch(name)
+    if not m:
+        return request_size(name, info), reply_size(info(name))
+    array, count = info(m.group(1)), int(m.group(2))
+    if array and (array.get("data_type_name") or array.get("data_type")) == "DWORD":  # BOOLs, 32 per word
+        return request_size(m.group(1), info), math.ceil(count / 32) * 4 + 8
+    overhead = 10 if array and array.get("tag_type") == "struct" else 8
+    return request_size(m.group(1), info), count * (reply_size(array) - overhead) + overhead
+
+
+def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BYTES, together=None):
+    """The reads for ``tags`` in packet order: [(read name, [(tag, path)])], path being the keys that slice the
+    tag's value out of the read value, or None for the value as read. ``get_info(name)`` is the driver's tag
+    definition, None if unknown. Names in ``no_group`` (lowercase) are not read whole. ``budget``: bytes per
+    packet. ``together(struct path)``: true if the requested tags under that struct are always read in one read."""
+    info = _info_getter(get_info)
     memo = {}
     parsed = {}  # tag -> tokens
     ancestors = {}  # tag -> [key], deepest first, of structs above it that can be read whole
     depth = defaultdict(dict)  # tag -> key -> number of tokens of that ancestor
-    names, sizes = {}, {}  # key -> read name, structure_size
+    names, sizes, levels = {}, {}, {}  # struct key -> read name, structure_size, number of tokens
     whole = {}  # key -> requested tag that is itself a whole-readable struct
+    elements = defaultdict(list)  # array key -> [(index, tag)] of requested elements of an atomic array
+    arrays = {}  # array key -> (array name, element size)
     seen = set()
     for tag in tags:
         tokens = tokenize(tag)
@@ -165,6 +216,12 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BY
         if tinfo is None or (_is_array(tinfo) and not isinstance(tokens[-1][1], (int, tuple))):
             continue  # unknown, or an array read without an index (its first element only)
         parsed[tag] = tokens
+        if len(tokens) > 1 and type(tokens[-1][1]) is int:
+            array = "".join(t for t, _ in tokens[:-1])
+            size = _element_size(info(array))
+            if size and array.lower() not in no_group:
+                elements[array.lower()].append((tokens[-1][1], tag))
+                arrays[array.lower()] = (array, size)
         found = []
         n = len(tokens)
         for k in range(n, 0, -1):
@@ -186,6 +243,7 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BY
             depth[tag][key] = k
             names.setdefault(key, prefix)
             sizes[key] = size
+            levels[key] = k
             if k == n:
                 whole[key] = tag
             else:
@@ -201,23 +259,64 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BY
     candidates = {key for key, served in under.items()
                   if len(served) >= 2 and (key in whole or sizes[key] <= whole_max_bytes)}
 
-    # reads: [key or None, members, (request, reply)], in the order they are sent; start with plain reads
-    reads = [[None, [tag], (request_size(tag), reply_size(info(tag) if tag in parsed else None))] for tag in tags]
+    # array runs: the requested elements, split where bridging the gap alone would break the cost rule
+    runs = {}  # run key -> (array name, element size, {tag: index})
+    for akey, items in elements.items():
+        items.sort()
+        array, size = arrays[akey]
+        clusters = [[items[0]]]
+        for index, tag in items[1:]:
+            if (index - clusters[-1][-1][0] - 1) * size > BYTES_PER_READ:
+                clusters.append([])
+            clusters[-1].append((index, tag))
+        for c, cluster in enumerate(clusters):
+            if len(cluster) >= 2:
+                key = f"{akey}{{{c}"  # a "{" is never in a struct key
+                runs[key] = (array, size, {tag: index for index, tag in cluster})
+                under[key] = {tag for _, tag in cluster}
+                candidates.add(key)
+
+    def group(key, members):
+        """(read name, (request, reply)) of the read of ``key`` that serves ``members``."""
+        if key not in runs:
+            return names[key], (request_size(names[key], info), sizes[key] + 10)
+        array, size, index = runs[key]
+        start = min(index[t] for t in members)
+        count = max(index[t] for t in members) - start + 1
+        return f"{array}[{start}]{{{count}}}", (request_size(f"{array}[{start}]", info), count * size + 8)
+
+    def merge(key):
+        """(reads with the ones all under ``key`` merged at the first one's place, reads saved, extra reply
+        bytes, read name), None if fewer than two reads are under it."""
+        covered = [i for i, r in enumerate(reads) if all(t in under[key] for t in r[1])]
+        if len(covered) < 2:
+            return None
+        members = [t for i in covered for t in reads[i][1]]
+        name, group_sizes = group(key, members)
+        new = [r for i, r in enumerate(reads) if i not in covered[1:]]
+        new[covered[0]] = [key, members, group_sizes, name]
+        return new, len(covered) - 1, group_sizes[1] - sum(reads[i][2][1] for i in covered), name
+
+    # reads: [key or None, members, (request, reply), read name], in the order they are sent; start plain
+    reads = [[None, [tag], read_size(tag, info), tag] for tag in tags]  # sized as chunks() sizes them
+    if together:  # outermost first; ignores whole_max_bytes and the cost rule, but must fit one packet
+        fits = budget - 8 - VERSION_REPLY
+        for key in sorted((k for k in sizes if len(under[k]) >= 2 and sizes[k] + 10 <= fits), key=levels.get):
+            if together(names[key]):
+                merged = merge(key)
+                if merged:
+                    reads = merged[0]
+                candidates.discard(key)
     limit = packets([r[2] for r in reads], budget)
     while candidates:
         best = None
         for key in candidates:
-            covered = [i for i, r in enumerate(reads) if all(t in under[key] for t in r[1])]
-            if len(covered) < 2:
+            merged = merge(key)
+            if merged is None:
                 continue
-            saved = len(covered) - 1
-            group = (request_size(names[key]), sizes[key] + 10)
-            extra = group[1] - sum(reads[i][2][1] for i in covered)
-            if extra > BYTES_PER_READ * saved:
+            new, saved, extra, name = merged
+            if extra > BYTES_PER_READ * saved or name.lower() in no_group:
                 continue
-            members = [t for i in covered for t in reads[i][1]]
-            new = [r for i, r in enumerate(reads) if i not in covered[1:]]
-            new[covered[0]] = [key, members, group]
             if packets([r[2] for r in new], budget) > limit:
                 continue
             score = (extra / saved, -saved, key)
@@ -229,16 +328,26 @@ def plan(tags, get_info, whole_max_bytes, no_group=frozenset(), budget=PACKET_BY
         candidates.discard(key)
 
     result = []
-    for key, members, _ in reads:
+    for key, members, _, name in reads:
         if key is None:
-            result.append((members[0], [(members[0], None)]))
-            continue
-        entries = []
-        for tag in members:
-            k = depth[tag][key]
-            entries.append((tag, None if k == len(parsed[tag]) else [key_ for _, key_ in parsed[tag][k:]]))
-        result.append((names[key], entries))
+            result.append((name, [(name, None)]))
+        elif key in runs:
+            index = runs[key][2]
+            start = min(index[t] for t in members)
+            result.append((name, [(tag, [index[tag] - start]) for tag in members]))
+        else:
+            entries = []
+            for tag in members:
+                k = depth[tag][key]
+                entries.append((tag, None if k == len(parsed[tag]) else [key_ for _, key_ in parsed[tag][k:]]))
+            result.append((name, entries))
     return result
+
+
+def chunks(reads, get_info, budget=PACKET_BYTES):
+    """``reads`` (a plan) split into lists of about one packet each, packed as ``packets`` counts them."""
+    groups, _ = _pack([read_size(name, get_info) for name, _ in reads], budget)
+    return [[reads[i] for i in g] for g in groups]
 
 
 def dig(value, path):
@@ -261,30 +370,41 @@ def _as_list(results):
     return results if isinstance(results, list) else [results]
 
 
-def execute(plc, reads):
-    """Runs a plan: ({tag: Tag}, names of the group reads that failed, number of read services).
-    The members of a failed group read are read one by one in the same call, so no value is ever wrong."""
-    names = [name for name, _ in reads]
-    results = _as_list(plc.read(*names)) if names else []
-    out, retry, failed = {}, [], []
-    for (name, members), result in zip(reads, results):
-        if len(members) == 1 and members[0][1] is None:
-            out[members[0][0]] = result
-            continue
-        if result.error is not None:
-            failed.append(name)
-            retry += [tag for tag, _ in members]
-            continue
-        for tag, path in members:
-            if path is None:
-                out[tag] = result
+def execute(plc, chunks, between=None):
+    """Runs a plan split by ``chunks``: ({tag: Tag}, names of the group reads that failed, read services sent).
+    One ``plc.read`` per chunk; after each chunk but the last, ``between({tag: Tag})`` gets that chunk's results,
+    which are then left out of the returned ones. The members of failed group reads are read one by one after
+    the last chunk, so no value is ever wrong. A plan that is not split is one chunk."""
+    if chunks and isinstance(chunks[0], tuple):
+        chunks = [chunks]
+    out, retry, failed, services = {}, [], [], 0
+    for n, chunk in enumerate(chunks):
+        names = [name for name, _ in chunk]
+        results = _as_list(plc.read(*names)) if names else []
+        services += len(names)
+        part = {}
+        for (name, members), result in zip(chunk, results):
+            if len(members) == 1 and members[0][1] is None:
+                part[members[0][0]] = result
                 continue
-            try:
-                out[tag] = Tag(tag, dig(result.value, path), None, None)
-            except (KeyError, IndexError, TypeError, StopIteration):
-                if name not in failed:
-                    failed.append(name)
-                retry.append(tag)
+            if result.error is not None:
+                failed.append(name)
+                retry += [tag for tag, _ in members]
+                continue
+            for tag, path in members:
+                if path is None:
+                    part[tag] = result
+                    continue
+                try:
+                    part[tag] = Tag(tag, dig(result.value, path), None, None)
+                except (KeyError, IndexError, TypeError, StopIteration):
+                    if name not in failed:
+                        failed.append(name)
+                    retry.append(tag)
+        if between is not None and n < len(chunks) - 1:
+            between(part)
+        else:
+            out.update(part)
     if retry:
         out.update(zip(retry, _as_list(plc.read(*retry))))
-    return out, failed, len(names) + len(retry)
+    return out, failed, services + len(retry)
