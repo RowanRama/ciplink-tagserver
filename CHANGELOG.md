@@ -1,5 +1,10 @@
 # Changelog
 
+## ciplink-tagserver 0.4.1
+
+- Works with ciplink 0.3 (the Rust-core release) as well as 0.2: `ciplink>=0.2,<0.4`. `pip install ciplink[server]`
+  installs ciplink with this server.
+
 ## ciplink-tagserver 0.4.0
 
 Needs ciplink 0.2. The protocol and `@ciplink/react` are unchanged; 0.3 configs work as before.

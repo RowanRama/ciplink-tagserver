@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -44,16 +44,21 @@ wheels = [
 
 [[package]]
 name = "ciplink"
-version = "0.2.0"
+version = "0.3.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/68/00/c214abb0b12d414462423bef5ab2ed0f282724e239e19ae9717792cc0c9e/ciplink-0.2.0.tar.gz", hash = "sha256:a0aea079d90cba48268034e395665bbfa23814aec5872d5c5ed2e0226110aebd", size = 116800, upload-time = "2026-10-15T12:56:24.332Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/98/a3/24d1f9cf78329196183fc25d38e45d54e4b82c9bd7faed54e3931e1d77a9/ciplink-0.3.3.tar.gz", hash = "sha256:6eb60a4fba728f920240fd85dc5314f5d27fbb2da5268434af796eeb42f7f688", size = 285734, upload-time = "2026-10-23T15:34:50.883Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e9/07/15b20fe1d2447a79dc17f302b195fd4d3ded8ee8e3daefae9ef9001e2563/ciplink-0.2.0-py3-none-any.whl", hash = "sha256:a629ab05e73ae85cc7fed2eccfa5896bc310ef9aa5e68aa194665f5dbcebfa68", size = 134269, upload-time = "2026-10-15T12:56:22.919Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/5f/2b49101afb20cc08cc58be65c1021cdd78b94d1820a603cacb4e04945d75/ciplink-0.3.3-cp39-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:1a777965446c490dbdfd49e5783053fa01e4c510630cad0dedfa7101f6feeea6", size = 2115691, upload-time = "2026-10-23T15:34:40.636Z" },
+    { url = "https://files.pythonhosted.org/packages/13/85/b18026a1b3c928d81b90c7e6a676c30b4a3ae3426a2f60f8ea684d5072fe/ciplink-0.3.3-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:545bfa29536e92cd6c0d54cf1f91ca00a0ebf295d80dcde1f7ad11e846087ef8", size = 1152847, upload-time = "2026-10-23T15:34:42.3Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/57/ecb9e5701b3b6d8dff7be32ca8e41fe23625e9adef0ae27f27c9b9cec061/ciplink-0.3.3-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b2feb3e780f1c252378f1f1e6597a197df01a949313c3c8b5296b9c5d98ecf5c", size = 1190646, upload-time = "2026-10-23T15:34:43.988Z" },
+    { url = "https://files.pythonhosted.org/packages/43/db/bbced1eb90744e3affa058e01ed10a97c4cf60c18884e63031e2169af618/ciplink-0.3.3-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:7f17755fff13e3da27d86a608cd021fb05a9d913ecea9735f0c2cdaf7ea3ecbe", size = 1330483, upload-time = "2026-10-23T15:34:45.719Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/96/e7b23cc3939946c45713c460748cc0d79e7f469dea2f50c3755a3efe2809/ciplink-0.3.3-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8a1423df2edefa93425aa3bd9938433010464c9ee21a1585aae077030864986c", size = 1409178, upload-time = "2026-10-23T15:34:47.734Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/47/556d5429db6ab84491125c6d944b8720710f25cf8f67c3fb20175ddee67c/ciplink-0.3.3-cp39-abi3-win_amd64.whl", hash = "sha256:470b11d96b74ac73d142b8ef7f4eb8f9eac602f8cefa9f5429138e9dcda1f896", size = 1084748, upload-time = "2026-10-23T15:34:49.346Z" },
 ]
 
 [[package]]
 name = "ciplink-tagserver"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "ciplink" },
@@ -70,7 +75,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ciplink", specifier = ">=0.2,<0.3" },
+    { name = "ciplink", specifier = ">=0.2,<0.4" },
     { name = "fastapi" },
     { name = "uvicorn", extras = ["standard"] },
 ]

@@ -5,7 +5,8 @@ over a WebSocket. Apps never talk to the PLCs: each PLC gets one connection, one
 loop, however many screens are open.
 
 It is built on [ciplink](https://pypi.org/project/ciplink/), a fork of pycomm3 that reads by instance
-ID and reloads its tag table by itself after online edits. 0.3 needs ciplink 0.2.
+ID and reloads its tag table by itself after online edits. It works with ciplink 0.2 and 0.3 (the Rust-core
+release); `pip install ciplink[server]` installs both.
 
 **Structure** (tags, types, UDTs) always comes from the controller. **Intent** (what may be written, limits,
 units, deadband, bit names, poll rates) comes from decorators in the config. Nothing is declared twice: the

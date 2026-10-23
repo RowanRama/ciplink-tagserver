@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ciplink-tagserver"
-version = "0.4.0"
+version = "0.4.1"
 description = "One server per site that owns the PLC connections and serves tag values over a WebSocket"
 readme = "README.md"
 license = "MIT"
@@ -22,7 +22,7 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "ciplink>=0.2,<0.3",
+    "ciplink>=0.2,<0.4",
     "fastapi",
     "uvicorn[standard]",
 ]
